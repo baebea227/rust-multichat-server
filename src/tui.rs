@@ -1,28 +1,37 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, List, ListItem, Paragraph},
-    Terminal,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter},
     sync::Mutex,
 };
 
-use crate::protocol::{ClientMsg, ServerMsg, N_OPTIONS};
+use crate::protocol::{ClientMsg, N_OPTIONS, ServerMsg};
 
 const MAX_MESSAGES: usize = 200;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 struct AppState {
     messages: Vec<String>,
@@ -184,7 +193,11 @@ async fn parse_input(input: &str, state: &Arc<Mutex<AppState>>) -> Option<Client
         return Some(ClientMsg::Unvote);
     }
 
-    Some(ClientMsg::Chat { text: input.to_string() })
+    // 이슈 7: 클라이언트 송신 시각 포함
+    Some(ClientMsg::Chat {
+        text: input.to_string(),
+        client_ts: now_ms(),
+    })
 }
 
 async fn send(
@@ -250,7 +263,11 @@ fn render_vote(f: &mut ratatui::Frame, state: &AppState, area: ratatui::layout::
             break;
         }
 
-        let ratio = if total > 0 { count as f64 / total as f64 } else { 0.0 };
+        let ratio = if total > 0 {
+            count as f64 / total as f64
+        } else {
+            0.0
+        };
         let is_mine = state.my_vote == Some(i);
         let label = if is_mine {
             format!("[{}]▶ {}/{}", i + 1, count, total)
@@ -263,7 +280,11 @@ fn render_vote(f: &mut ratatui::Frame, state: &AppState, area: ratatui::layout::
             .gauge_style(
                 Style::default()
                     .fg(if is_mine { Color::Yellow } else { Color::Cyan })
-                    .add_modifier(if is_mine { Modifier::BOLD } else { Modifier::empty() }),
+                    .add_modifier(if is_mine {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             )
             .label(label)
             .ratio(ratio);
@@ -288,13 +309,15 @@ fn render_input(f: &mut ratatui::Frame, state: &AppState, area: ratatui::layout:
         Span::styled(&state.input, Style::default().fg(Color::White)),
         hint,
     ]);
-    let p = Paragraph::new(input_line)
-        .block(Block::default().borders(Borders::ALL).title(" 입력 "));
+    let p =
+        Paragraph::new(input_line).block(Block::default().borders(Borders::ALL).title(" 입력 "));
     f.render_widget(p, area);
 
     // border(1) + "> "(2) + 입력 문자 너비
-    let input_width: u16 = state.input.chars().map(|c| {
-        if c.len_utf8() > 1 { 2 } else { 1 }
-    }).sum();
+    let input_width: u16 = state
+        .input
+        .chars()
+        .map(|c| if c.len_utf8() > 1 { 2 } else { 1 })
+        .sum();
     f.set_cursor_position((area.x + 1 + 2 + input_width, area.y + 1));
 }

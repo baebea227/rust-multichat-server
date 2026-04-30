@@ -1,10 +1,18 @@
+use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader, BufWriter};
-use anyhow::Result;
 
-use crate::protocol::ClientMsg;
 use super::{connect, send_msg};
+use crate::protocol::ClientMsg;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 pub async fn run(id: u64, msg_count: usize, recv_counter: Arc<AtomicU64>) -> Result<()> {
     let stream = connect().await?;
@@ -27,10 +35,17 @@ pub async fn run(id: u64, msg_count: usize, recv_counter: Arc<AtomicU64>) -> Res
         count
     });
 
-    // 송신
+    // 송신: 클라이언트 송신 시각 client_ts 포함
     for seq in 0..msg_count {
         let text = format!("bot_{id}_msg_{seq}");
-        send_msg(&mut writer, &ClientMsg::Chat { text }).await?;
+        send_msg(
+            &mut writer,
+            &ClientMsg::Chat {
+                text,
+                client_ts: now_ms(),
+            },
+        )
+        .await?;
     }
 
     // recv 완료 대기 후 writer 종료

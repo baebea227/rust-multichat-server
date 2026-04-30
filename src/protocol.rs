@@ -7,7 +7,11 @@ pub const N_OPTIONS: usize = 4;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
     /// 채팅 메시지
-    Chat { text: String },
+    Chat {
+        text: String,
+        /// 클라이언트 송신 시각 (Unix ms) — 서버에서 latency 계산 기준
+        client_ts: u64,
+    },
     /// 투표 (option: 0..N_OPTIONS)
     Vote { option: usize },
     /// 투표 철회

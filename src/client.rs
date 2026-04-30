@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::{
     metrics::Metrics,
-    protocol::{BroadcastEvent, ClientMsg, ServerMsg, MAX_LINE_LEN},
+    protocol::{BroadcastEvent, ClientMsg, MAX_LINE_LEN, ServerMsg},
     room::Room,
     vote::VoteBoard,
 };
@@ -67,7 +67,6 @@ pub async fn handle_client(
                             continue;
                         }
                         metrics.record_recv();
-                        let sent_at = now_ms();
 
                         let msg: ClientMsg = match serde_json::from_str(&raw) {
                             Ok(m) => m,
@@ -75,8 +74,10 @@ pub async fn handle_client(
                         };
 
                         match msg {
-                            ClientMsg::Chat { text } => {
-                                metrics.record_latency(sent_at);
+                            ClientMsg::Chat { text, client_ts } => {
+                                // 이슈 7: 클라이언트 송신 시각(client_ts) 기준으로 latency 측정
+                                metrics.record_latency(client_ts);
+                                let sent_at = now_ms();
                                 room.broadcast(ServerMsg::Chat { from: id, text, sent_at });
                                 metrics.record_sent();
                             }
