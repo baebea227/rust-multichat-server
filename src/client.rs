@@ -1,11 +1,11 @@
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     sync::broadcast,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     metrics::Metrics,
@@ -13,6 +13,9 @@ use crate::{
     room::Room,
     vote::VoteBoard,
 };
+
+const TOKEN_CAPACITY: f64 = 10.0;
+const TOKEN_RATE: f64 = 10.0;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -56,6 +59,8 @@ pub async fn handle_client(
     });
 
     let mut current_vote: Option<usize> = None;
+    let mut tokens: f64 = TOKEN_CAPACITY;
+    let mut last_refill = Instant::now();
 
     // read task (현재 task): 소켓 수신 → 처리
     loop {
@@ -72,6 +77,16 @@ pub async fn handle_client(
                             Ok(m) => m,
                             Err(_) => continue,
                         };
+
+                        // 클라이언트별 rate limiting: 토큰 버킷 (10 token/s, burst 10)
+                        let elapsed = last_refill.elapsed().as_secs_f64();
+                        last_refill = Instant::now();
+                        tokens = (tokens + elapsed * TOKEN_RATE).min(TOKEN_CAPACITY);
+                        if tokens < 1.0 {
+                            warn!(id, "rate limit 초과 — 메시지 드롭");
+                            continue;
+                        }
+                        tokens -= 1.0;
 
                         match msg {
                             ClientMsg::Chat { text, client_ts } => {
