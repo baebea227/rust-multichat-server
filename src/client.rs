@@ -35,7 +35,12 @@ pub async fn handle_client(
     let mut lines = BufReader::new(reader).lines();
     let mut rx: broadcast::Receiver<BroadcastEvent> = room.subscribe();
 
-    room.join(id).await;
+    // 이슈 4: 입장 후 현재 참여자 수를 받아 Welcome 메시지로 즉시 전송 (broadcast 아님)
+    let peer_count = room.join(id).await;
+    let welcome = ServerMsg::Welcome { peer_count };
+    let mut welcome_line = serde_json::to_string(&welcome).unwrap_or_default();
+    welcome_line.push('\n');
+    writer.write_all(welcome_line.as_bytes()).await?;
 
     // write task: broadcast 수신 → 소켓 송신
     let mut write_task = tokio::spawn(async move {

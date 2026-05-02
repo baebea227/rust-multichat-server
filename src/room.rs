@@ -28,12 +28,17 @@ impl Room {
         self.tx.subscribe()
     }
 
-    pub async fn join(&self, id: u64) {
-        self.clients.write().await.insert(id, ClientMeta { id });
+    /// 입장 처리 후 현재 참여자 수 반환 (이슈 4: Welcome 전송용)
+    pub async fn join(&self, id: u64) -> u64 {
+        let mut clients = self.clients.write().await;
+        clients.insert(id, ClientMeta { id });
+        let count = clients.len() as u64;
+        drop(clients);
         let _ = self.tx.send(BroadcastEvent::Server(ServerMsg::Presence {
             id,
             joined: true,
         }));
+        count
     }
 
     pub async fn leave(&self, id: u64) {

@@ -77,6 +77,10 @@ pub async fn run(addr: &str) -> Result<()> {
             };
             let mut s = state_net.lock().await;
             match msg {
+                // 이슈 4: 접속 시점의 참여자 수로 client_count 초기화
+                ServerMsg::Welcome { peer_count } => {
+                    s.client_count = peer_count as usize;
+                }
                 ServerMsg::Chat { from, text, .. } => {
                     s.push_msg(format!("[{from}] {text}"));
                 }

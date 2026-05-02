@@ -22,6 +22,8 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    /// 신규 접속자에게만 전송 — 접속 시점의 참여자 수 초기값 전달 (이슈 4)
+    Welcome { peer_count: u64 },
     /// 브로드캐스트 채팅
     Chat {
         from: u64,
