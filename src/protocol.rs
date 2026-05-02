@@ -12,6 +12,8 @@ pub enum ClientMsg {
         /// 클라이언트 송신 시각 (Unix ms) — 서버에서 latency 계산 기준
         client_ts: u64,
     },
+    /// 닉네임 설정 (이슈 5)
+    SetNick { name: String },
     /// 투표 (option: 0..N_OPTIONS)
     Vote { option: usize },
     /// 투표 철회
@@ -27,6 +29,8 @@ pub enum ServerMsg {
     /// 브로드캐스트 채팅
     Chat {
         from: u64,
+        /// 발신자 닉네임 (없으면 ID로 표시) (이슈 5)
+        nick: Option<String>,
         text: String,
         /// 전송 시각 (Unix ms)
         sent_at: u64,

@@ -66,6 +66,7 @@ pub async fn handle_client(
     let mut current_vote: Option<usize> = None;
     let mut tokens: f64 = TOKEN_CAPACITY;
     let mut last_refill = Instant::now();
+    let mut nick: Option<String> = None; // 이슈 5: 닉네임
 
     // read task (현재 task): 소켓 수신 → 처리
     loop {
@@ -94,11 +95,21 @@ pub async fn handle_client(
                         tokens -= 1.0;
 
                         match msg {
+                            ClientMsg::SetNick { name } => {
+                                // 이슈 5: 닉네임 로컬 저장 + room 메타 업데이트
+                                room.set_nick(id, name.clone()).await;
+                                nick = Some(name);
+                            }
                             ClientMsg::Chat { text, client_ts } => {
                                 // 이슈 7: 클라이언트 송신 시각(client_ts) 기준으로 latency 측정
                                 metrics.record_latency(client_ts);
                                 let sent_at = now_ms();
-                                room.broadcast(ServerMsg::Chat { from: id, text, sent_at });
+                                room.broadcast(ServerMsg::Chat {
+                                    from: id,
+                                    nick: nick.clone(), // 이슈 5
+                                    text,
+                                    sent_at,
+                                });
                                 metrics.record_sent();
                             }
                             ClientMsg::Vote { option } => {

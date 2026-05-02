@@ -8,6 +8,8 @@ pub const BROADCAST_CAP: usize = 2048;
 #[derive(Debug, Clone)]
 pub struct ClientMeta {
     pub id: u64,
+    /// 닉네임 (이슈 5)
+    pub name: Option<String>,
 }
 
 pub struct Room {
@@ -31,7 +33,7 @@ impl Room {
     /// 입장 처리 후 현재 참여자 수 반환 (이슈 4: Welcome 전송용)
     pub async fn join(&self, id: u64) -> u64 {
         let mut clients = self.clients.write().await;
-        clients.insert(id, ClientMeta { id });
+        clients.insert(id, ClientMeta { id, name: None });
         let count = clients.len() as u64;
         drop(clients);
         let _ = self.tx.send(BroadcastEvent::Server(ServerMsg::Presence {
@@ -51,6 +53,13 @@ impl Room {
 
     pub async fn client_count(&self) -> usize {
         self.clients.read().await.len()
+    }
+
+    /// 닉네임 설정 (이슈 5)
+    pub async fn set_nick(&self, id: u64, name: String) {
+        if let Some(meta) = self.clients.write().await.get_mut(&id) {
+            meta.name = Some(name);
+        }
     }
 
     pub fn broadcast(&self, msg: ServerMsg) {
