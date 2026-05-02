@@ -35,8 +35,12 @@ pub enum ServerMsg {
         /// 전송 시각 (Unix ms)
         sent_at: u64,
     },
-    /// 투표 현황 스냅샷
-    VoteSnapshot { counts: [u64; N_OPTIONS] },
+    /// 투표 현황 스냅샷 (이슈 6: percentages 추가로 클라이언트 중복 연산 제거)
+    VoteSnapshot {
+        counts: [u64; N_OPTIONS],
+        /// 각 옵션 비율 (0.0~1.0), 서버에서 계산해 전달
+        percentages: [f32; N_OPTIONS],
+    },
     /// 참여자 입장/퇴장 알림
     Presence { id: u64, joined: bool },
     /// 서버 측 오류 메시지

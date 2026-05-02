@@ -36,6 +36,8 @@ fn now_ms() -> u64 {
 struct AppState {
     messages: Vec<String>,
     vote_counts: [u64; N_OPTIONS],
+    /// 이슈 6: 서버에서 계산된 비율 (0.0~1.0)
+    vote_percentages: [f32; N_OPTIONS],
     client_count: usize,
     input: String,
     my_vote: Option<usize>,
@@ -46,6 +48,7 @@ impl AppState {
         Self {
             messages: Vec::new(),
             vote_counts: [0; N_OPTIONS],
+            vote_percentages: [0.0; N_OPTIONS],
             client_count: 0,
             input: String::new(),
             my_vote: None,
@@ -86,8 +89,9 @@ pub async fn run(addr: &str) -> Result<()> {
                     let sender = nick.unwrap_or_else(|| from.to_string());
                     s.push_msg(format!("[{sender}] {text}"));
                 }
-                ServerMsg::VoteSnapshot { counts } => {
+                ServerMsg::VoteSnapshot { counts, percentages } => {
                     s.vote_counts = counts;
+                    s.vote_percentages = percentages; // 이슈 6
                 }
                 ServerMsg::Presence { id, joined } => {
                     if joined {
@@ -278,11 +282,8 @@ fn render_vote(f: &mut ratatui::Frame, state: &AppState, area: ratatui::layout::
             break;
         }
 
-        let ratio = if total > 0 {
-            count as f64 / total as f64
-        } else {
-            0.0
-        };
+        // 이슈 6: 서버에서 받은 percentages 사용 (중복 계산 제거)
+        let ratio = state.vote_percentages[i] as f64;
         let is_mine = state.my_vote == Some(i);
         let label = if is_mine {
             format!("[{}]▶ {}/{}", i + 1, count, total)

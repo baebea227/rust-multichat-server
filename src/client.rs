@@ -115,16 +115,15 @@ pub async fn handle_client(
                             ClientMsg::Vote { option } => {
                                 vote.vote(current_vote, option);
                                 current_vote = Some(option);
-                                room.broadcast(ServerMsg::VoteSnapshot {
-                                    counts: vote.snapshot(),
-                                });
+                                // 이슈 6: percentages 함께 전송
+                                let (counts, percentages) = vote.snapshot_with_percentages();
+                                room.broadcast(ServerMsg::VoteSnapshot { counts, percentages });
                             }
                             ClientMsg::Unvote => {
                                 if let Some(prev) = current_vote.take() {
                                     vote.unvote(prev);
-                                    room.broadcast(ServerMsg::VoteSnapshot {
-                                        counts: vote.snapshot(),
-                                    });
+                                    let (counts, percentages) = vote.snapshot_with_percentages();
+                                    room.broadcast(ServerMsg::VoteSnapshot { counts, percentages });
                                 }
                             }
                         }

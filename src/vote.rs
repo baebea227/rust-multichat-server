@@ -35,4 +35,18 @@ impl VoteBoard {
     pub fn snapshot(&self) -> [u64; N_OPTIONS] {
         std::array::from_fn(|i| self.counts[i].load(Ordering::Relaxed).max(0) as u64)
     }
+
+    /// 이슈 6: counts와 percentages(0.0~1.0)를 함께 반환
+    pub fn snapshot_with_percentages(&self) -> ([u64; N_OPTIONS], [f32; N_OPTIONS]) {
+        let counts = self.snapshot();
+        let total: u64 = counts.iter().sum();
+        let percentages = std::array::from_fn(|i| {
+            if total > 0 {
+                counts[i] as f32 / total as f32
+            } else {
+                0.0
+            }
+        });
+        (counts, percentages)
+    }
 }
