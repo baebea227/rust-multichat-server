@@ -36,6 +36,8 @@ fn now_ms() -> u64 {
 struct AppState {
     messages: Vec<String>,
     vote_counts: [u64; N_OPTIONS],
+    /// 이슈 6: 서버에서 계산된 비율 (0.0~1.0)
+    vote_percentages: [f32; N_OPTIONS],
     client_count: usize,
     input: String,
     my_vote: Option<usize>,
@@ -46,6 +48,7 @@ impl AppState {
         Self {
             messages: Vec::new(),
             vote_counts: [0; N_OPTIONS],
+            vote_percentages: [0.0; N_OPTIONS],
             client_count: 0,
             input: String::new(),
             my_vote: None,
@@ -77,11 +80,18 @@ pub async fn run(addr: &str) -> Result<()> {
             };
             let mut s = state_net.lock().await;
             match msg {
-                ServerMsg::Chat { from, text, .. } => {
-                    s.push_msg(format!("[{from}] {text}"));
+                // 이슈 4: 접속 시점의 참여자 수로 client_count 초기화
+                ServerMsg::Welcome { peer_count } => {
+                    s.client_count = peer_count as usize;
                 }
-                ServerMsg::VoteSnapshot { counts } => {
+                ServerMsg::Chat { from, nick, text, .. } => {
+                    // 이슈 5: 닉네임 있으면 닉네임, 없으면 ID 표시
+                    let sender = nick.unwrap_or_else(|| from.to_string());
+                    s.push_msg(format!("[{sender}] {text}"));
+                }
+                ServerMsg::VoteSnapshot { counts, percentages } => {
                     s.vote_counts = counts;
+                    s.vote_percentages = percentages; // 이슈 6
                 }
                 ServerMsg::Presence { id, joined } => {
                     if joined {
@@ -177,6 +187,15 @@ async fn event_loop(
 }
 
 async fn parse_input(input: &str, state: &Arc<Mutex<AppState>>) -> Option<ClientMsg> {
+    // 이슈 5: /nick <이름> 명령어
+    if let Some(rest) = input.strip_prefix("/nick ") {
+        let name = rest.trim().to_string();
+        if !name.is_empty() {
+            return Some(ClientMsg::SetNick { name });
+        }
+        return None;
+    }
+
     if let Some(rest) = input.strip_prefix("/vote ") {
         if let Ok(n) = rest.trim().parse::<usize>() {
             let option = n.saturating_sub(1); // 1-based → 0-based
@@ -263,11 +282,8 @@ fn render_vote(f: &mut ratatui::Frame, state: &AppState, area: ratatui::layout::
             break;
         }
 
-        let ratio = if total > 0 {
-            count as f64 / total as f64
-        } else {
-            0.0
-        };
+        // 이슈 6: 서버에서 받은 percentages 사용 (중복 계산 제거)
+        let ratio = state.vote_percentages[i] as f64;
         let is_mine = state.my_vote == Some(i);
         let label = if is_mine {
             format!("[{}]▶ {}/{}", i + 1, count, total)
@@ -301,7 +317,7 @@ fn render_vote(f: &mut ratatui::Frame, state: &AppState, area: ratatui::layout::
 
 fn render_input(f: &mut ratatui::Frame, state: &AppState, area: ratatui::layout::Rect) {
     let hint = Span::styled(
-        " /vote 1~4  /unvote  Esc:종료",
+        " /nick <이름>  /vote 1~4  /unvote  Esc:종료",
         Style::default().fg(Color::DarkGray),
     );
     let input_line = Line::from(vec![
