@@ -1,15 +1,8 @@
-mod bot;
-mod client;
-mod metrics;
-mod protocol;
-mod room;
-mod server;
-mod tui;
-mod vote;
-
 use std::time::Duration;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+
+use rust_projects::{bot, metrics, room, server, tui, vote};
 
 #[derive(Parser)]
 #[command(name = "chat-server")]
@@ -35,12 +28,15 @@ enum Command {
         /// 봇 수
         #[arg(long, default_value_t = 500)]
         count: usize,
-        /// 봇 모드: normal | fickle | spammer | ghost | quitter
+        /// 봇 모드: normal | fickle | spammer | ghost | quitter | mixed
         #[arg(long, default_value = "normal")]
         mode: String,
         /// 봇 1개당 메시지(또는 투표) 수
         #[arg(long, default_value_t = 100)]
         msg: usize,
+        /// 봇 타입별 비율 (mixed 모드 전용). 예: "normal:40,spammer:20,fickle:20,ghost:10,quitter:10"
+        #[arg(long)]
+        ratio: Option<String>,
     },
 }
 
@@ -63,8 +59,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Client { addr } => {
             tui::run(&addr).await?;
         }
-        Command::BotTest { count, mode, msg } => {
-            bot::run_scenario(&mode, count, msg).await;
+        Command::BotTest { count, mode, msg, ratio } => {
+            bot::run_scenario(&mode, count, msg, ratio.as_deref()).await;
         }
     }
 

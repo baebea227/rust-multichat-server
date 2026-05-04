@@ -5,14 +5,229 @@ pub mod quitter;
 pub mod spammer;
 
 use anyhow::Result;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tokio::net::TcpStream;
 use tracing::info;
 
 use crate::protocol::ClientMsg;
 
 pub const SERVER_ADDR: &str = "127.0.0.1:8080";
+pub const BOT_RECV_TIMEOUT_SECS: u64 = 30;
+
+// ── Scenario Report: RttCounter ─────────────────────────────────────
+
+/// Lock-free RTT 누적 카운터 (AtomicU64 기반)
+pub struct RttCounter {
+    pub sum_ms: AtomicU64,
+    pub count: AtomicU64,
+}
+
+impl RttCounter {
+    /// 새 RttCounter를 Arc로 감싸서 생성
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            sum_ms: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        })
+    }
+
+    /// RTT 값(밀리초)을 누적 기록
+    pub fn record(&self, rtt_ms: u64) {
+        self.sum_ms.fetch_add(rtt_ms, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 평균 RTT 계산. 기록이 없으면 None 반환
+    pub fn average(&self) -> Option<u64> {
+        let c = self.count.load(Ordering::Relaxed);
+        if c == 0 {
+            None
+        } else {
+            Some(self.sum_ms.load(Ordering::Relaxed) / c)
+        }
+    }
+}
+
+// ── Scenario Report: ScenarioReport 구조체 ──────────────────────────
+
+/// 시나리오 실행 결과 요약 리포트
+#[derive(Debug)]
+pub struct ScenarioReport {
+    pub mode: String,
+    pub total_bots: usize,
+    pub success_count: usize,
+    pub failure_count: usize,
+    pub elapsed_secs: f64,
+    pub avg_rtt_ms: Option<u64>,
+}
+
+impl fmt::Display for ScenarioReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rtt_str = match self.avg_rtt_ms {
+            Some(ms) => format!("{ms}ms"),
+            None => "N/A".to_string(),
+        };
+        write!(
+            f,
+            "=== Scenario Report ===\n\
+             mode: {}\n\
+             total_bots: {}\n\
+             success: {}\n\
+             failure: {}\n\
+             elapsed: {:.2}s\n\
+             avg_rtt: {}",
+            self.mode, self.total_bots, self.success_count,
+            self.failure_count, self.elapsed_secs, rtt_str
+        )
+    }
+}
+
+// ── Task 1: BotType 열거형 ──────────────────────────────────────────
+
+/// 봇 동작 유형을 나타내는 열거형
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BotType {
+    Normal,
+    Fickle,
+    Spammer,
+    Ghost,
+    Quitter,
+}
+
+impl BotType {
+    /// 문자열에서 BotType으로 변환
+    pub fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "normal" => Ok(BotType::Normal),
+            "fickle" => Ok(BotType::Fickle),
+            "spammer" => Ok(BotType::Spammer),
+            "ghost" => Ok(BotType::Ghost),
+            "quitter" => Ok(BotType::Quitter),
+            other => Err(format!("유효하지 않은 봇 타입: '{other}'")),
+        }
+    }
+
+    /// BotType을 문자열로 변환
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BotType::Normal => "normal",
+            BotType::Fickle => "fickle",
+            BotType::Spammer => "spammer",
+            BotType::Ghost => "ghost",
+            BotType::Quitter => "quitter",
+        }
+    }
+}
+
+// ── Task 1: RatioSpec 구조체 ────────────────────────────────────────
+
+/// 봇 타입별 비율을 저장하는 구조체
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RatioSpec {
+    /// 순서 보존을 위해 Vec 사용
+    pub entries: Vec<(BotType, u32)>,
+}
+
+impl RatioSpec {
+    /// 기본 비율 문자열
+    pub const DEFAULT: &str = "normal:40,spammer:20,fickle:20,ghost:10,quitter:10";
+
+    /// 비율 문자열을 파싱하여 RatioSpec을 생성
+    ///
+    /// 형식: `타입:숫자,타입:숫자,...`
+    /// 예: `"normal:40,spammer:20,fickle:20,ghost:10,quitter:10"`
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("비율 문자열이 비어 있습니다".to_string());
+        }
+
+        let mut entries = Vec::new();
+        for part in s.split(',') {
+            let part = part.trim();
+            let (type_str, ratio_str) = part
+                .split_once(':')
+                .ok_or_else(|| format!("잘못된 형식: '{part}' ('타입:숫자' 형식이어야 합니다)"))?;
+
+            let type_str = type_str.trim();
+            let ratio_str = ratio_str.trim();
+
+            let bot_type = BotType::from_str(type_str)?;
+
+            let ratio: u32 = ratio_str
+                .parse()
+                .map_err(|_| format!("비율 값이 유효한 숫자가 아닙니다: '{ratio_str}'"))?;
+
+            if ratio == 0 {
+                return Err(format!("비율 값은 1 이상이어야 합니다: '{type_str}:{ratio}'"));
+            }
+
+            entries.push((bot_type, ratio));
+        }
+
+        Ok(RatioSpec { entries })
+    }
+}
+
+impl fmt::Display for RatioSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let parts: Vec<String> = self
+            .entries
+            .iter()
+            .map(|(bt, r)| format!("{}:{}", bt.as_str(), r))
+            .collect();
+        write!(f, "{}", parts.join(","))
+    }
+}
+
+// ── Task 2: BotAllocator 배분 로직 ──────────────────────────────────
+
+/// 총 봇 수를 비율에 따라 각 BotType별로 배분
+///
+/// 알고리즘:
+/// 1. 비율 합계 계산
+/// 2. 각 타입별 `floor(total * ratio / sum)` 계산
+/// 3. 나머지 = `total - 배분 합계`
+/// 4. 나머지를 비율이 높은 순서대로 1개씩 배분
+pub fn allocate(total: usize, spec: &RatioSpec) -> Vec<(BotType, usize)> {
+    if spec.entries.is_empty() {
+        return Vec::new();
+    }
+
+    let ratio_sum: u32 = spec.entries.iter().map(|(_, r)| *r).sum();
+
+    // 기본 floor 배분
+    let mut result: Vec<(BotType, usize, u32)> = spec
+        .entries
+        .iter()
+        .map(|(bt, r)| {
+            let allocated = (total as u64 * *r as u64 / ratio_sum as u64) as usize;
+            (*bt, allocated, *r)
+        })
+        .collect();
+
+    let allocated_sum: usize = result.iter().map(|(_, a, _)| *a).sum();
+    let mut remainder = total.saturating_sub(allocated_sum);
+
+    // 나머지를 비율이 높은 순서대로 1개씩 배분
+    // 인덱스를 비율 내림차순으로 정렬 (비율이 같으면 원래 순서 유지)
+    let mut indices: Vec<usize> = (0..result.len()).collect();
+    indices.sort_by(|&a, &b| result[b].2.cmp(&result[a].2));
+
+    let mut idx = 0;
+    while remainder > 0 {
+        result[indices[idx]].1 += 1;
+        remainder -= 1;
+        idx = (idx + 1) % indices.len();
+    }
+
+    result.into_iter().map(|(bt, a, _)| (bt, a)).collect()
+}
+
+// ── 기존 헬퍼 함수 ─────────────────────────────────────────────────
 
 /// 봇이 소켓으로 JSON 메시지 한 줄을 전송하는 헬퍼
 pub async fn send_msg(
@@ -31,20 +246,112 @@ pub async fn connect() -> Result<TcpStream> {
     Ok(TcpStream::connect(SERVER_ADDR).await?)
 }
 
+// ── Task 3: run_scenario (mixed 분기 추가) ──────────────────────────
+
 /// 전체 봇 시나리오 실행기
-pub async fn run_scenario(mode: &str, count: usize, msg_per_bot: usize) {
+///
+/// `ratio`는 mixed 모드에서만 사용된다. 단일 모드에서는 무시된다.
+pub async fn run_scenario(mode: &str, count: usize, msg_per_bot: usize, ratio: Option<&str>) {
+    if mode == "mixed" {
+        run_mixed_scenario(count, msg_per_bot, ratio).await;
+    } else {
+        run_single_scenario(mode, count, msg_per_bot).await;
+    }
+}
+
+/// mixed 모드: 비율에 따라 여러 봇 타입을 혼합 실행
+async fn run_mixed_scenario(count: usize, msg_per_bot: usize, ratio: Option<&str>) {
+    let start = Instant::now();
+
+    let spec = match ratio {
+        Some(r) => RatioSpec::parse(r).expect("유효하지 않은 ratio"),
+        None => RatioSpec::parse(RatioSpec::DEFAULT).unwrap(),
+    };
+    let allocation = allocate(count, &spec);
+
+    // 각 타입별 배분 수 로그 출력
+    for (bt, n) in &allocation {
+        info!(bot_type = bt.as_str(), count = n, "mixed 모드 봇 배분");
+    }
+
     let recv_counter = Arc::new(AtomicU64::new(0));
+    let rtt_counter = RttCounter::new();
+    let mut handles = Vec::new();
+    let mut bot_id: u64 = 0;
+
+    for (bt, n) in &allocation {
+        for _ in 0..*n {
+            let recv_counter = recv_counter.clone();
+            let rtt_counter = rtt_counter.clone();
+            let bt = *bt;
+            let id = bot_id;
+            bot_id += 1;
+
+            let handle = tokio::spawn(async move {
+                let result = match bt {
+                    BotType::Normal => {
+                        normal::run(id, msg_per_bot, recv_counter, rtt_counter).await
+                    }
+                    BotType::Fickle => fickle::run(id, msg_per_bot).await,
+                    BotType::Spammer => {
+                        spammer::run(id, msg_per_bot, recv_counter, rtt_counter).await
+                    }
+                    BotType::Ghost => ghost::run(id, msg_per_bot).await,
+                    BotType::Quitter => quitter::run(id).await,
+                };
+                if let Err(ref e) = result {
+                    tracing::warn!("봇 {id} ({}) 오류: {e}", bt.as_str());
+                }
+                result
+            });
+            handles.push(handle);
+        }
+    }
+
+    let mut success_count = 0usize;
+    let mut failure_count = 0usize;
+    for h in handles {
+        match h.await {
+            Ok(Ok(())) => success_count += 1,
+            Ok(Err(_)) => failure_count += 1,
+            Err(_join_err) => failure_count += 1,
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let report = ScenarioReport {
+        mode: "mixed".to_string(),
+        total_bots: count,
+        success_count,
+        failure_count,
+        elapsed_secs: elapsed,
+        avg_rtt_ms: rtt_counter.average(),
+    };
+    info!("\n{report}");
+}
+
+/// 기존 단일 모드 시나리오
+async fn run_single_scenario(mode: &str, count: usize, msg_per_bot: usize) {
+    let start = Instant::now();
+
+    let recv_counter = Arc::new(AtomicU64::new(0));
+    let rtt_counter = RttCounter::new();
     let mut handles = Vec::with_capacity(count);
 
     for i in 0..count {
         let recv_counter = recv_counter.clone();
+        let rtt_counter = rtt_counter.clone();
         let mode = mode.to_string();
 
         let handle = tokio::spawn(async move {
             let result = match mode.as_str() {
-                "normal" => normal::run(i as u64, msg_per_bot, recv_counter).await,
+                "normal" => {
+                    normal::run(i as u64, msg_per_bot, recv_counter, rtt_counter).await
+                }
                 "fickle" => fickle::run(i as u64, msg_per_bot).await,
-                "spammer" => spammer::run(i as u64, msg_per_bot, recv_counter).await,
+                "spammer" => {
+                    spammer::run(i as u64, msg_per_bot, recv_counter, rtt_counter).await
+                }
                 "ghost" => ghost::run(i as u64, msg_per_bot).await,
                 "quitter" => quitter::run(i as u64).await,
                 other => {
@@ -52,17 +359,25 @@ pub async fn run_scenario(mode: &str, count: usize, msg_per_bot: usize) {
                     Ok(())
                 }
             };
-            if let Err(e) = result {
+            if let Err(ref e) = result {
                 tracing::warn!("봇 {i} 오류: {e}");
             }
+            result
         });
         handles.push(handle);
     }
 
+    let mut success_count = 0usize;
+    let mut failure_count = 0usize;
     for h in handles {
-        let _ = h.await;
+        match h.await {
+            Ok(Ok(())) => success_count += 1,
+            Ok(Err(_)) => failure_count += 1,
+            Err(_join_err) => failure_count += 1,
+        }
     }
 
+    // 기존 normal 모드 누락 검증 유지
     if mode == "normal" {
         let expected = (count * msg_per_bot) as u64;
         let received = recv_counter.load(Ordering::SeqCst);
@@ -72,5 +387,537 @@ pub async fn run_scenario(mode: &str, count: usize, msg_per_bot: usize) {
             "메시지 누락 발생! expected={expected} received={received}"
         );
         info!("누락 없음 확인");
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    let report = ScenarioReport {
+        mode: mode.to_string(),
+        total_bots: count,
+        success_count,
+        failure_count,
+        elapsed_secs: elapsed,
+        avg_rtt_ms: rtt_counter.average(),
+    };
+    info!("\n{report}");
+}
+
+
+// ── Task 5 & 6: 단위 테스트 + 속성 기반 테스트 ─────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── 5.1 RatioSpec::parse() 정상 케이스 ──────────────────────────
+
+    #[test]
+    fn parse_default_ratio() {
+        let spec = RatioSpec::parse(RatioSpec::DEFAULT).unwrap();
+        assert_eq!(spec.entries.len(), 5);
+        assert_eq!(spec.entries[0], (BotType::Normal, 40));
+        assert_eq!(spec.entries[1], (BotType::Spammer, 20));
+        assert_eq!(spec.entries[2], (BotType::Fickle, 20));
+        assert_eq!(spec.entries[3], (BotType::Ghost, 10));
+        assert_eq!(spec.entries[4], (BotType::Quitter, 10));
+    }
+
+    #[test]
+    fn parse_single_entry() {
+        let spec = RatioSpec::parse("normal:100").unwrap();
+        assert_eq!(spec.entries, vec![(BotType::Normal, 100)]);
+    }
+
+    #[test]
+    fn parse_with_whitespace() {
+        let spec = RatioSpec::parse("  normal:40 , spammer:20  ").unwrap();
+        assert_eq!(spec.entries.len(), 2);
+        assert_eq!(spec.entries[0], (BotType::Normal, 40));
+        assert_eq!(spec.entries[1], (BotType::Spammer, 20));
+    }
+
+    // ── 5.2 RatioSpec::parse() 오류 케이스 ──────────────────────────
+
+    #[test]
+    fn parse_empty_string() {
+        assert!(RatioSpec::parse("").is_err());
+    }
+
+    #[test]
+    fn parse_whitespace_only() {
+        assert!(RatioSpec::parse("   ").is_err());
+    }
+
+    #[test]
+    fn parse_bad_format_no_colon() {
+        assert!(RatioSpec::parse("normal40").is_err());
+    }
+
+    #[test]
+    fn parse_zero_ratio() {
+        assert!(RatioSpec::parse("normal:0").is_err());
+    }
+
+    #[test]
+    fn parse_invalid_bot_type() {
+        assert!(RatioSpec::parse("unknown:10").is_err());
+    }
+
+    #[test]
+    fn parse_non_numeric_ratio() {
+        assert!(RatioSpec::parse("normal:abc").is_err());
+    }
+
+    // ── 5.3 allocate() 기본 비율 + 500봇 ───────────────────────────
+
+    #[test]
+    fn allocate_default_500() {
+        let spec = RatioSpec::parse(RatioSpec::DEFAULT).unwrap();
+        let result = allocate(500, &spec);
+
+        // 합계 검증
+        let total: usize = result.iter().map(|(_, n)| *n).sum();
+        assert_eq!(total, 500);
+
+        // 비율 40:20:20:10:10 → 200:100:100:50:50
+        assert_eq!(result[0], (BotType::Normal, 200));
+        assert_eq!(result[1], (BotType::Spammer, 100));
+        assert_eq!(result[2], (BotType::Fickle, 100));
+        assert_eq!(result[3], (BotType::Ghost, 50));
+        assert_eq!(result[4], (BotType::Quitter, 50));
+    }
+
+    #[test]
+    fn allocate_default_501() {
+        // 501봇: 나머지 1개는 비율이 가장 높은 normal에 배분
+        let spec = RatioSpec::parse(RatioSpec::DEFAULT).unwrap();
+        let result = allocate(501, &spec);
+
+        let total: usize = result.iter().map(|(_, n)| *n).sum();
+        assert_eq!(total, 501);
+
+        // normal이 나머지 1개를 받아야 함
+        assert_eq!(result[0], (BotType::Normal, 201));
+    }
+
+    // ── 5.4 allocate() edge case: 봇 수 < 타입 수 ──────────────────
+
+    #[test]
+    fn allocate_fewer_bots_than_types() {
+        let spec = RatioSpec::parse(RatioSpec::DEFAULT).unwrap();
+        let result = allocate(3, &spec);
+
+        let total: usize = result.iter().map(|(_, n)| *n).sum();
+        assert_eq!(total, 3);
+
+        // 비율 높은 순서대로 배분: normal(40), spammer(20), fickle(20)
+        // floor 배분은 모두 0이므로 나머지 3개를 비율 높은 순서대로 배분
+        let normal_count = result.iter().find(|(bt, _)| *bt == BotType::Normal).unwrap().1;
+        assert!(normal_count >= 1, "비율이 가장 높은 normal은 최소 1개 배분");
+    }
+
+    #[test]
+    fn allocate_zero_bots() {
+        let spec = RatioSpec::parse(RatioSpec::DEFAULT).unwrap();
+        let result = allocate(0, &spec);
+
+        let total: usize = result.iter().map(|(_, n)| *n).sum();
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn allocate_one_bot() {
+        let spec = RatioSpec::parse(RatioSpec::DEFAULT).unwrap();
+        let result = allocate(1, &spec);
+
+        let total: usize = result.iter().map(|(_, n)| *n).sum();
+        assert_eq!(total, 1);
+    }
+
+    // ── BotType 변환 테스트 ─────────────────────────────────────────
+
+    #[test]
+    fn bot_type_roundtrip() {
+        let types = [BotType::Normal, BotType::Fickle, BotType::Spammer, BotType::Ghost, BotType::Quitter];
+        for bt in &types {
+            assert_eq!(BotType::from_str(bt.as_str()).unwrap(), *bt);
+        }
+    }
+
+    #[test]
+    fn bot_type_invalid() {
+        assert!(BotType::from_str("invalid").is_err());
+        assert!(BotType::from_str("").is_err());
+    }
+
+    // ── Task 6: 속성 기반 테스트 (proptest) ─────────────────────────
+
+    use proptest::prelude::*;
+
+    /// 유효한 BotType을 생성하는 전략
+    fn arb_bot_type() -> impl Strategy<Value = BotType> {
+        prop_oneof![
+            Just(BotType::Normal),
+            Just(BotType::Fickle),
+            Just(BotType::Spammer),
+            Just(BotType::Ghost),
+            Just(BotType::Quitter),
+        ]
+    }
+
+    /// 유효한 RatioSpec entries를 생성하는 전략 (1~5개 항목, 비율 1~100)
+    fn arb_ratio_entries() -> impl Strategy<Value = Vec<(BotType, u32)>> {
+        // 중복 없는 BotType 선택을 위해 서브셋 방식 사용
+        (1u32..=100, 1u32..=100, 1u32..=100, 1u32..=100, 1u32..=100, 1usize..=5)
+            .prop_map(|(r1, r2, r3, r4, r5, count)| {
+                let all = vec![
+                    (BotType::Normal, r1),
+                    (BotType::Spammer, r2),
+                    (BotType::Fickle, r3),
+                    (BotType::Ghost, r4),
+                    (BotType::Quitter, r5),
+                ];
+                all.into_iter().take(count).collect::<Vec<_>>()
+            })
+    }
+
+    /// 유효한 RatioSpec을 생성하는 전략
+    fn arb_ratio_spec() -> impl Strategy<Value = RatioSpec> {
+        arb_ratio_entries().prop_map(|entries| RatioSpec { entries })
+    }
+
+    // ── 6.2 Property 1: RatioSpec 라운드트립 ────────────────────────
+    // **Validates: Requirements 3.4**
+    proptest! {
+        #[test]
+        fn prop_ratio_spec_roundtrip(spec in arb_ratio_spec()) {
+            // Property 1: parse(to_string(spec)) == spec
+            let serialized = spec.to_string();
+            let parsed = RatioSpec::parse(&serialized)
+                .expect("라운드트립 파싱 실패");
+            prop_assert_eq!(parsed.entries, spec.entries);
+        }
+    }
+
+    // ── 6.3 Property 2: 유효하지 않은 입력 거부 ─────────────────────
+    // **Validates: Requirements 2.4, 3.2, 3.3**
+    proptest! {
+        #[test]
+        fn prop_invalid_bot_type_rejected(
+            invalid_name in "[a-z]{1,10}"
+                .prop_filter("유효한 봇 타입 제외",
+                    |s| !["normal","fickle","spammer","ghost","quitter"].contains(&s.as_str())),
+            ratio in 1u32..=100
+        ) {
+            // (a) 유효하지 않은 봇 타입명
+            let input = format!("{}:{}", invalid_name, ratio);
+            prop_assert!(RatioSpec::parse(&input).is_err(),
+                "유효하지 않은 봇 타입 '{}'이 허용됨", invalid_name);
+        }
+
+        #[test]
+        fn prop_bad_format_rejected(
+            word in "[a-z]{1,10}"
+        ) {
+            // (b) 콜론 없는 형식
+            prop_assert!(RatioSpec::parse(&word).is_err(),
+                "콜론 없는 형식 '{}'이 허용됨", word);
+        }
+
+        #[test]
+        fn prop_zero_ratio_rejected(
+            bot_type in arb_bot_type()
+        ) {
+            // (c) 비율 값이 0
+            let input = format!("{}:0", bot_type.as_str());
+            prop_assert!(RatioSpec::parse(&input).is_err(),
+                "비율 0이 허용됨: '{}'", input);
+        }
+    }
+
+    // ── 6.4 Property 3: 배분 합계 불변량 ────────────────────────────
+    // **Validates: Requirements 4.2**
+    proptest! {
+        #[test]
+        fn prop_allocation_sum_equals_total(
+            total in 0usize..=10000,
+            spec in arb_ratio_spec()
+        ) {
+            let result = allocate(total, &spec);
+            let sum: usize = result.iter().map(|(_, n)| *n).sum();
+            prop_assert_eq!(sum, total,
+                "배분 합계({})가 total({})과 불일치. spec={}, result={:?}",
+                sum, total, spec, result);
+        }
+    }
+
+    // ── 6.5 Property 4: 비율 비례 배분 ──────────────────────────────
+    // **Validates: Requirements 2.1, 4.1**
+    proptest! {
+        #[test]
+        fn prop_proportional_allocation(
+            total in 0usize..=10000,
+            spec in arb_ratio_spec()
+        ) {
+            let result = allocate(total, &spec);
+            let ratio_sum: u64 = spec.entries.iter().map(|(_, r)| *r as u64).sum();
+
+            for (i, (bt, count)) in result.iter().enumerate() {
+                let ratio = spec.entries[i].1 as u64;
+                let floor_val = (total as u64 * ratio / ratio_sum) as usize;
+                prop_assert!(*count >= floor_val,
+                    "{:?} 배분({})이 floor({})보다 작음. total={}, spec={}",
+                    bt, count, floor_val, total, spec);
+            }
+        }
+    }
+
+    // ── 6.6 Property 5: 나머지 배분 순서 ────────────────────────────
+    // **Validates: Requirements 4.3, 4.4**
+    proptest! {
+        #[test]
+        fn prop_remainder_allocation_order(
+            total in 0usize..=10000,
+            spec in arb_ratio_spec()
+        ) {
+            let result = allocate(total, &spec);
+            let ratio_sum: u64 = spec.entries.iter().map(|(_, r)| *r as u64).sum();
+
+            // 각 타입의 나머지(실제 배분 - floor 배분) 계산
+            let remainders: Vec<(BotType, usize, u32)> = result.iter().enumerate().map(|(i, (bt, count))| {
+                let ratio = spec.entries[i].1;
+                let floor_val = (total as u64 * ratio as u64 / ratio_sum) as usize;
+                let extra = count - floor_val;
+                (*bt, extra, ratio)
+            }).collect();
+
+            // 나머지를 받은 타입의 비율은 나머지를 받지 못한 타입의 비율 이상이어야 함
+            for got in remainders.iter().filter(|(_, extra, _)| *extra > 0) {
+                for not_got in remainders.iter().filter(|(_, extra, _)| *extra == 0) {
+                    prop_assert!(got.2 >= not_got.2,
+                        "나머지 배분 순서 위반: {:?}(비율={})이 나머지를 받았지만 {:?}(비율={})은 받지 못함",
+                        got.0, got.2, not_got.0, not_got.2);
+                }
+            }
+        }
+    }
+
+    // ── Task 4: ScenarioReport / RttCounter 단위 테스트 ─────────────
+
+    // ── 4.1 ScenarioReport Display 출력 형식 테스트 (모든 필드 포함) ─
+    #[test]
+    fn scenario_report_display_all_fields() {
+        let report = ScenarioReport {
+            mode: "normal".to_string(),
+            total_bots: 100,
+            success_count: 95,
+            failure_count: 5,
+            elapsed_secs: 12.345,
+            avg_rtt_ms: Some(42),
+        };
+        let output = format!("{report}");
+
+        assert!(output.contains("=== Scenario Report ==="));
+        assert!(output.contains("mode: normal"));
+        assert!(output.contains("total_bots: 100"));
+        assert!(output.contains("success: 95"));
+        assert!(output.contains("failure: 5"));
+        assert!(output.contains("elapsed: 12.35s"));
+        assert!(output.contains("avg_rtt: 42ms"));
+    }
+
+    // ── 4.2 ScenarioReport Display에서 avg_rtt_ms가 None일 때 "N/A" ─
+    #[test]
+    fn scenario_report_display_rtt_none_shows_na() {
+        let report = ScenarioReport {
+            mode: "ghost".to_string(),
+            total_bots: 10,
+            success_count: 10,
+            failure_count: 0,
+            elapsed_secs: 1.0,
+            avg_rtt_ms: None,
+        };
+        let output = format!("{report}");
+
+        assert!(output.contains("avg_rtt: N/A"));
+        // "ms"가 avg_rtt 라인에 나타나지 않아야 함
+        for line in output.lines() {
+            if line.starts_with("avg_rtt:") {
+                assert!(!line.contains("ms"), "None일 때 'ms'가 포함되면 안 됨");
+            }
+        }
+    }
+
+    // ── 4.3 RttCounter record/average 기본 동작 테스트 ──────────────
+    #[test]
+    fn rtt_counter_record_and_average() {
+        let counter = RttCounter::new();
+        counter.record(10);
+        counter.record(20);
+        counter.record(30);
+
+        // 평균: (10 + 20 + 30) / 3 = 20
+        assert_eq!(counter.average(), Some(20));
+    }
+
+    // ── 4.4 RttCounter 빈 상태에서 average() → None ────────────────
+    #[test]
+    fn rtt_counter_empty_average_is_none() {
+        let counter = RttCounter::new();
+        assert_eq!(counter.average(), None);
+    }
+
+    // ── Task 5: ScenarioReport / RttCounter 속성 기반 테스트 ────────
+
+    /// 유효한 ScenarioReport를 생성하는 전략
+    fn arb_scenario_report() -> impl Strategy<Value = ScenarioReport> {
+        (
+            prop_oneof![
+                Just("normal".to_string()),
+                Just("fickle".to_string()),
+                Just("spammer".to_string()),
+                Just("ghost".to_string()),
+                Just("quitter".to_string()),
+                Just("mixed".to_string()),
+            ],
+            0usize..=10000,
+            prop::option::of(0u64..=100_000),
+        )
+            .prop_flat_map(|(mode, total, avg_rtt_ms)| {
+                // success_count는 0..=total 범위에서 생성
+                (Just(mode), Just(total), 0..=total, Just(avg_rtt_ms))
+            })
+            .prop_flat_map(|(mode, total, success, avg_rtt_ms)| {
+                let failure = total - success;
+                // elapsed_secs: 0.0 ~ 3600.0
+                (Just(mode), Just(total), Just(success), Just(failure), 0.0f64..3600.0, Just(avg_rtt_ms))
+            })
+            .prop_map(|(mode, total_bots, success_count, failure_count, elapsed_secs, avg_rtt_ms)| {
+                ScenarioReport {
+                    mode,
+                    total_bots,
+                    success_count,
+                    failure_count,
+                    elapsed_secs,
+                    avg_rtt_ms,
+                }
+            })
+    }
+
+    /// Display 출력 문자열에서 ScenarioReport 필드를 파싱하는 헬퍼
+    fn parse_report_display(s: &str) -> Option<(String, usize, usize, usize, String, String)> {
+        let mut mode = None;
+        let mut total_bots = None;
+        let mut success = None;
+        let mut failure = None;
+        let mut elapsed = None;
+        let mut avg_rtt = None;
+
+        for line in s.lines() {
+            if let Some(v) = line.strip_prefix("mode: ") {
+                mode = Some(v.to_string());
+            } else if let Some(v) = line.strip_prefix("total_bots: ") {
+                total_bots = Some(v.parse::<usize>().ok()?);
+            } else if let Some(v) = line.strip_prefix("success: ") {
+                success = Some(v.parse::<usize>().ok()?);
+            } else if let Some(v) = line.strip_prefix("failure: ") {
+                failure = Some(v.parse::<usize>().ok()?);
+            } else if let Some(v) = line.strip_prefix("elapsed: ") {
+                elapsed = Some(v.to_string());
+            } else if let Some(v) = line.strip_prefix("avg_rtt: ") {
+                avg_rtt = Some(v.to_string());
+            }
+        }
+
+        Some((mode?, total_bots?, success?, failure?, elapsed?, avg_rtt?))
+    }
+
+    // ── 5.1 Property 1: 성공/실패 합계 불변량 ──────────────────────
+    // **Validates: Requirements 2.4**
+    proptest! {
+        #[test]
+        fn prop_scenario_report_success_failure_sum(
+            report in arb_scenario_report()
+        ) {
+            // Property 1: success_count + failure_count == total_bots
+            prop_assert_eq!(
+                report.success_count + report.failure_count,
+                report.total_bots,
+                "성공({}) + 실패({}) != 전체({})",
+                report.success_count, report.failure_count, report.total_bots
+            );
+        }
+    }
+
+    // ── 5.2 Property 2: Display 포맷 라운드트립 ─────────────────────
+    // **Validates: Requirements 5.3**
+    proptest! {
+        #[test]
+        fn prop_scenario_report_display_roundtrip(
+            report in arb_scenario_report()
+        ) {
+            let output = format!("{report}");
+            let parsed = parse_report_display(&output);
+            prop_assert!(parsed.is_some(), "Display 출력 파싱 실패: {}", output);
+
+            let (mode, total_bots, success, failure, elapsed_str, rtt_str) = parsed.unwrap();
+
+            prop_assert_eq!(&mode, &report.mode);
+            prop_assert_eq!(total_bots, report.total_bots);
+            prop_assert_eq!(success, report.success_count);
+            prop_assert_eq!(failure, report.failure_count);
+
+            // elapsed: "{:.2}s" 형식 검증
+            let expected_elapsed = format!("{:.2}s", report.elapsed_secs);
+            prop_assert_eq!(&elapsed_str, &expected_elapsed);
+
+            // avg_rtt 검증
+            let expected_rtt = match report.avg_rtt_ms {
+                Some(ms) => format!("{ms}ms"),
+                None => "N/A".to_string(),
+            };
+            prop_assert_eq!(&rtt_str, &expected_rtt);
+        }
+    }
+
+    // ── 5.3 Property 3: 평균 RTT 계산 정확성 ───────────────────────
+    // **Validates: Requirements 3.2, 3.3**
+    proptest! {
+        #[test]
+        fn prop_rtt_counter_average_correctness(
+            values in prop::collection::vec(1u64..=10_000, 0..100)
+        ) {
+            let counter = RttCounter::new();
+            for &v in &values {
+                counter.record(v);
+            }
+
+            if values.is_empty() {
+                prop_assert_eq!(counter.average(), None,
+                    "빈 RttCounter의 average()는 None이어야 함");
+            } else {
+                let expected_sum: u64 = values.iter().sum();
+                let expected_avg = expected_sum / values.len() as u64;
+                prop_assert_eq!(counter.average(), Some(expected_avg),
+                    "average() 불일치: values={:?}, sum={}, count={}",
+                    values, expected_sum, values.len());
+            }
+        }
+    }
+
+    // ── 5.4 Property 4: Display 출력 필드 완전성 ────────────────────
+    // **Validates: Requirements 4.2, 5.2**
+    proptest! {
+        #[test]
+        fn prop_scenario_report_display_field_completeness(
+            report in arb_scenario_report()
+        ) {
+            let output = format!("{report}");
+
+            let required_keys = ["mode:", "total_bots:", "success:", "failure:", "elapsed:", "avg_rtt:"];
+            for key in &required_keys {
+                prop_assert!(output.contains(key),
+                    "Display 출력에 '{}' 키가 누락됨. 출력:\n{}", key, output);
+            }
+        }
     }
 }
