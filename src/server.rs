@@ -19,6 +19,16 @@ pub static CONN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn run(addr: &str, room: Arc<Room>, vote: Arc<VoteBoard>, metrics: Arc<Metrics>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
+    run_with_listener(listener, room, vote, metrics).await
+}
+
+pub async fn run_with_listener(
+    listener: TcpListener,
+    room: Arc<Room>,
+    vote: Arc<VoteBoard>,
+    metrics: Arc<Metrics>,
+) -> anyhow::Result<()> {
+    let addr = listener.local_addr()?;
     info!("서버 시작: {addr}");
 
     loop {

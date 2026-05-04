@@ -19,7 +19,12 @@ pub struct Room {
 
 impl Room {
     pub fn new() -> Arc<Self> {
-        let (tx, _) = broadcast::channel(BROADCAST_CAP);
+        Self::new_with_capacity(BROADCAST_CAP)
+    }
+
+    /// 지정된 broadcast 채널 용량으로 Room 생성
+    pub fn new_with_capacity(capacity: usize) -> Arc<Self> {
+        let (tx, _) = broadcast::channel(capacity);
         Arc::new(Self {
             tx,
             clients: Arc::new(RwLock::new(HashMap::new())),
