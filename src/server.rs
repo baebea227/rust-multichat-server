@@ -15,8 +15,6 @@ use crate::{
 
 pub const MAX_CONNECTIONS: usize = 500;
 
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-
 pub async fn run(addr: &str, room: Arc<Room>, vote: Arc<VoteBoard>, metrics: Arc<Metrics>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     run_with_listener(listener, room, vote, metrics).await
@@ -32,6 +30,7 @@ pub async fn run_with_listener(
     info!("서버 시작: {addr}");
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let next_id = Arc::new(AtomicU64::new(1));
 
     loop {
         tokio::select! {
@@ -55,7 +54,7 @@ pub async fn run_with_listener(
                             }
                         };
 
-                        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                        let id = next_id.fetch_add(1, Ordering::Relaxed);
                         let room = room.clone();
                         let vote = vote.clone();
                         let metrics = metrics.clone();
