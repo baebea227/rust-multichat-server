@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     sync::broadcast,
 };
@@ -16,6 +16,58 @@ use crate::{
 
 const TOKEN_CAPACITY: f64 = 10.0;
 const TOKEN_RATE: f64 = 10.0;
+
+/// '\n'으로 종료된 한 줄을 읽되 max_len 바이트로 상한을 강제한다.
+/// 초과 라인은 다음 '\n'까지 드레인하고 빈 문자열을 반환 — 호출측 JSON 파싱에서 자연스럽게 스킵됨.
+async fn read_line_bounded<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_len: usize,
+) -> std::io::Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut overflow = false;
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            if buf.is_empty() && !overflow {
+                return Ok(None);
+            }
+            if overflow {
+                return Ok(Some(String::new()));
+            }
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        }
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            if !overflow {
+                let avail = max_len.saturating_sub(buf.len());
+                let take = pos.min(avail);
+                buf.extend_from_slice(&chunk[..take]);
+                if pos > avail {
+                    overflow = true;
+                }
+            }
+            let consume_n = pos + 1;
+            reader.consume(consume_n);
+            if overflow {
+                return Ok(Some(String::new()));
+            }
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+        } else {
+            if !overflow {
+                let avail = max_len.saturating_sub(buf.len());
+                let take = chunk.len().min(avail);
+                buf.extend_from_slice(&chunk[..take]);
+                if chunk.len() > avail {
+                    overflow = true;
+                }
+            }
+            let n = chunk.len();
+            reader.consume(n);
+        }
+    }
+}
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -32,7 +84,7 @@ pub async fn handle_client(
     metrics: Arc<Metrics>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
     let mut rx: broadcast::Receiver<BroadcastEvent> = room.subscribe();
 
     // 이슈 4: 입장 후 현재 참여자 수를 받아 Welcome 메시지로 즉시 전송 (broadcast 아님)
@@ -71,13 +123,9 @@ pub async fn handle_client(
     // read task (현재 task): 소켓 수신 → 처리
     loop {
         tokio::select! {
-            line = lines.next_line() => {
+            line = read_line_bounded(&mut reader, MAX_LINE_LEN) => {
                 match line {
                     Ok(Some(raw)) => {
-                        if raw.len() > MAX_LINE_LEN {
-                            continue;
-                        }
-
                         let msg: ClientMsg = match serde_json::from_str(&raw) {
                             Ok(m) => m,
                             Err(_) => continue,
