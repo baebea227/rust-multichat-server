@@ -68,6 +68,8 @@ pub async fn run_with_listener(
                             }
                         });
                         handles.push(handle);
+                        // 종료된 핸들 회수 — 장기 가동 시 unbounded 누적 방지
+                        handles.retain(|h| !h.is_finished());
                     }
                     Err(e) => {
                         warn!("accept 실패: {e}");
