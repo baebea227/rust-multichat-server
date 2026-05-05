@@ -32,8 +32,10 @@ pub enum ServerMsg {
         /// 발신자 닉네임 (없으면 ID로 표시) (이슈 5)
         nick: Option<String>,
         text: String,
-        /// 전송 시각 (Unix ms)
+        /// 서버 broadcast 시각 (Unix ms)
         sent_at: u64,
+        /// 발신자가 보낸 client_ts를 그대로 echo — 발신자가 자체 RTT 계산 가능
+        client_ts: u64,
     },
     /// 투표 현황 스냅샷 (이슈 6: percentages 추가로 클라이언트 중복 연산 제거)
     VoteSnapshot {

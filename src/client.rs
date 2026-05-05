@@ -149,14 +149,15 @@ pub async fn handle_client(
                                 nick = Some(name);
                             }
                             ClientMsg::Chat { text, client_ts } => {
-                                // 이슈 7: 클라이언트 송신 시각(client_ts) 기준으로 latency 측정
-                                metrics.record_latency(client_ts);
+                                // client_ts를 echo하여 발신자가 자체 RTT 계산 가능 (#6)
+                                // — wall-clock 시계 스큐 영향을 받지 않음
                                 let sent_at = now_ms();
                                 room.broadcast(ServerMsg::Chat {
                                     from: id,
-                                    nick: nick.clone(), // 이슈 5
+                                    nick: nick.clone(),
                                     text,
                                     sent_at,
+                                    client_ts,
                                 });
                                 metrics.record_sent();
                             }
