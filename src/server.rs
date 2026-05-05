@@ -15,7 +15,6 @@ use crate::{
 pub const MAX_CONNECTIONS: usize = 500;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-pub static CONN_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub async fn run(addr: &str, room: Arc<Room>, vote: Arc<VoteBoard>, metrics: Arc<Metrics>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
@@ -31,13 +30,15 @@ pub async fn run_with_listener(
     let addr = listener.local_addr()?;
     info!("서버 시작: {addr}");
 
+    let conn_count = Arc::new(AtomicUsize::new(0));
+
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, peer)) => {
                         // 연결 수 상한 확인: 초과 시 오류 응답 후 즉시 소켓 닫기
-                        if CONN_COUNT.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+                        if conn_count.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
                             warn!(%peer, "최대 연결 수 초과 — 접속 거절");
                             tokio::spawn(async move {
                                 let (_, mut writer) = stream.into_split();
@@ -50,17 +51,18 @@ pub async fn run_with_listener(
                             continue;
                         }
 
-                        CONN_COUNT.fetch_add(1, Ordering::Relaxed);
+                        conn_count.fetch_add(1, Ordering::Relaxed);
                         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                         let room = room.clone();
                         let vote = vote.clone();
                         let metrics = metrics.clone();
-                        info!(id, %peer, "클라이언트 접속 (현재 {}명)", CONN_COUNT.load(Ordering::Relaxed));
+                        let conn_count = conn_count.clone();
+                        info!(id, %peer, "클라이언트 접속 (현재 {}명)", conn_count.load(Ordering::Relaxed));
                         tokio::spawn(async move {
                             if let Err(e) = handle_client(id, stream, room, vote, metrics).await {
                                 warn!(id, "클라이언트 오류: {e}");
                             }
-                            CONN_COUNT.fetch_sub(1, Ordering::Relaxed);
+                            conn_count.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
                     Err(e) => {
