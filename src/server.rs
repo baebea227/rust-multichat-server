@@ -1,7 +1,8 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
 use crate::{
@@ -30,39 +31,41 @@ pub async fn run_with_listener(
     let addr = listener.local_addr()?;
     info!("서버 시작: {addr}");
 
-    let conn_count = Arc::new(AtomicUsize::new(0));
+    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((stream, peer)) => {
-                        // 연결 수 상한 확인: 초과 시 오류 응답 후 즉시 소켓 닫기
-                        if conn_count.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
-                            warn!(%peer, "최대 연결 수 초과 — 접속 거절");
-                            tokio::spawn(async move {
-                                let (_, mut writer) = stream.into_split();
-                                let msg = ServerMsg::Error { msg: "서버가 가득 찼습니다 (최대 500인)".into() };
-                                if let Ok(mut line) = serde_json::to_string(&msg) {
-                                    line.push('\n');
-                                    let _ = writer.write_all(line.as_bytes()).await;
-                                }
-                            });
-                            continue;
-                        }
+                        // permit 획득 실패 시 연결 거절 — load/add 분리 없이 원자적으로 상한 보장
+                        let permit = match semaphore.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                warn!(%peer, "최대 연결 수 초과 — 접속 거절");
+                                tokio::spawn(async move {
+                                    let (_, mut writer) = stream.into_split();
+                                    let msg = ServerMsg::Error { msg: "서버가 가득 찼습니다 (최대 500인)".into() };
+                                    if let Ok(mut line) = serde_json::to_string(&msg) {
+                                        line.push('\n');
+                                        let _ = writer.write_all(line.as_bytes()).await;
+                                    }
+                                });
+                                continue;
+                            }
+                        };
 
-                        conn_count.fetch_add(1, Ordering::Relaxed);
                         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
                         let room = room.clone();
                         let vote = vote.clone();
                         let metrics = metrics.clone();
-                        let conn_count = conn_count.clone();
-                        info!(id, %peer, "클라이언트 접속 (현재 {}명)", conn_count.load(Ordering::Relaxed));
+                        let active = MAX_CONNECTIONS - semaphore.available_permits();
+                        info!(id, %peer, "클라이언트 접속 (현재 {active}명)");
                         tokio::spawn(async move {
+                            let _permit = permit; // task 종료(패닉 포함) 시 자동 반납
                             if let Err(e) = handle_client(id, stream, room, vote, metrics).await {
                                 warn!(id, "클라이언트 오류: {e}");
                             }
-                            conn_count.fetch_sub(1, Ordering::Relaxed);
                         });
                     }
                     Err(e) => {
