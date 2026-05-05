@@ -14,15 +14,18 @@ impl VoteBoard {
         })
     }
 
-    /// 투표. 이전 선택이 있으면 먼저 철회 후 새 옵션에 추가.
+    /// 투표. 이전 선택이 있으면 새 옵션을 먼저 +1 한 뒤 이전 옵션을 -1.
+    /// 두 fetch_add는 비원자이지만 순서를 (next++, prev--)로 두어 옵저버가
+    /// 보는 일시 상태를 항상 "over-count"로 만든다 — `.max(0)` 클램프와 결합해
+    /// 옵션별 카운트가 음수로 노출되는 가시 race를 차단.
     pub fn vote(&self, prev: Option<usize>, next: usize) {
+        if next < N_OPTIONS {
+            self.counts[next].fetch_add(1, Ordering::Relaxed);
+        }
         if let Some(p) = prev {
             if p < N_OPTIONS {
                 self.counts[p].fetch_add(-1, Ordering::Relaxed);
             }
-        }
-        if next < N_OPTIONS {
-            self.counts[next].fetch_add(1, Ordering::Relaxed);
         }
     }
 
