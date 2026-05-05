@@ -31,6 +31,7 @@ pub async fn run_with_listener(
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let next_id = Arc::new(AtomicU64::new(1));
+    let mut handles = Vec::new();
 
     loop {
         tokio::select! {
@@ -60,12 +61,13 @@ pub async fn run_with_listener(
                         let metrics = metrics.clone();
                         let active = MAX_CONNECTIONS - semaphore.available_permits();
                         info!(id, %peer, "클라이언트 접속 (현재 {active}명)");
-                        tokio::spawn(async move {
+                        let handle = tokio::spawn(async move {
                             let _permit = permit; // task 종료(패닉 포함) 시 자동 반납
                             if let Err(e) = handle_client(id, stream, room, vote, metrics).await {
                                 warn!(id, "클라이언트 오류: {e}");
                             }
                         });
+                        handles.push(handle);
                     }
                     Err(e) => {
                         warn!("accept 실패: {e}");
@@ -79,6 +81,11 @@ pub async fn run_with_listener(
             }
         }
     }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+    info!("모든 클라이언트 태스크 종료 — shutdown 완료");
 
     Ok(())
 }
