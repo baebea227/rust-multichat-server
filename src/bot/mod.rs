@@ -71,7 +71,7 @@ pub struct FickleResult {
 /// 투표 정합성 검증 결과
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoteIntegrityResult {
-    /// 정합성 통과 여부
+    /// 정합성 통과 여부 — 옵션별 분포까지 정확히 일치할 때만 true
     pub passed: bool,
     /// 봇 측 기대 투표 배열
     pub expected: [u64; N_OPTIONS],
@@ -102,10 +102,8 @@ pub fn check_vote_integrity(
     actual: [u64; N_OPTIONS],
     fickle_count: usize,
 ) -> VoteIntegrityResult {
-    let expected_sum: u64 = expected.iter().sum();
-    let actual_sum: u64 = actual.iter().sum();
     VoteIntegrityResult {
-        passed: expected_sum == actual_sum,
+        passed: expected == actual,
         expected,
         actual,
         fickle_count,
@@ -1169,8 +1167,8 @@ mod tests {
 
     #[test]
     fn check_vote_integrity_pass() {
-        let expected = [3, 2, 1, 4]; // 총합 10
-        let actual = [2, 3, 1, 4];   // 총합 10
+        let expected = [3, 2, 1, 4];
+        let actual = [3, 2, 1, 4]; // 옵션별 분포까지 정확히 일치
         let result = check_vote_integrity(expected, actual, 10);
         assert!(result.passed);
         assert_eq!(result.expected, expected);
@@ -1298,13 +1296,11 @@ mod tests {
         ) {
             let result = check_vote_integrity(expected, actual, fickle_count);
 
-            let expected_sum: u64 = expected.iter().sum();
-            let actual_sum: u64 = actual.iter().sum();
-            let should_pass = expected_sum == actual_sum;
+            let should_pass = expected == actual;
 
             prop_assert_eq!(result.passed, should_pass,
-                "passed({})가 총합 비교({} == {})와 불일치. expected={:?}, actual={:?}",
-                result.passed, expected_sum, actual_sum, expected, actual);
+                "passed({})가 element-wise 비교와 불일치. expected={:?}, actual={:?}",
+                result.passed, expected, actual);
         }
     }
 
