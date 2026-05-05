@@ -291,13 +291,13 @@ async fn run_eof_recv_scenario(msg_count: u64, actual_send: u64) -> u64 {
     received
 }
 
-/// Property 2.1: 정상 수신 보존 — 모든 메시지가 도착하면 msg_count개 수신 후 즉시 종료
-///
-/// **Validates: Requirements 3.1**
-///
-/// FOR ALL msg_count in 1..=50:
-///   서버가 msg_count개 메시지를 모두 전송하고 연결 종료하면
-///   recv_task는 msg_count를 반환하고 즉시 종료해야 한다
+// Property 2.1: 정상 수신 보존 — 모든 메시지가 도착하면 msg_count개 수신 후 즉시 종료
+//
+// **Validates: Requirements 3.1**
+//
+// FOR ALL msg_count in 1..=50:
+//   서버가 msg_count개 메시지를 모두 전송하고 연결 종료하면
+//   recv_task는 msg_count를 반환하고 즉시 종료해야 한다
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(20))]
     #[test]
@@ -321,14 +321,14 @@ proptest! {
     }
 }
 
-/// Property 2.2: EOF 처리 보존 — 서버가 연결을 정상 종료하면 루프가 종료
-///
-/// **Validates: Requirements 3.2**
-///
-/// FOR ALL (msg_count, actual_send) where actual_send <= msg_count:
-///   서버가 actual_send개 전송 후 연결 종료(EOF)하면
-///   recv_task는 actual_send를 반환하고 루프가 종료되어야 한다
-///   (connection_alive = false이므로 isBugCondition = false)
+// Property 2.2: EOF 처리 보존 — 서버가 연결을 정상 종료하면 루프가 종료
+//
+// **Validates: Requirements 3.2**
+//
+// FOR ALL (msg_count, actual_send) where actual_send <= msg_count:
+//   서버가 actual_send개 전송 후 연결 종료(EOF)하면
+//   recv_task는 actual_send를 반환하고 루프가 종료되어야 한다
+//   (connection_alive = false이므로 isBugCondition = false)
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(20))]
     #[test]
@@ -366,13 +366,13 @@ proptest! {
     }
 }
 
-/// Property 2.3: recv_counter 누적 보존 — 수신된 count가 정확히 누적
-///
-/// **Validates: Requirements 3.3**
-///
-/// FOR ALL msg_count in 1..=30:
-///   recv_task가 반환한 count를 recv_counter에 fetch_add하면
-///   recv_counter의 값이 정확히 count만큼 증가해야 한다
+// Property 2.3: recv_counter 누적 보존 — 수신된 count가 정확히 누적
+//
+// **Validates: Requirements 3.3**
+//
+// FOR ALL msg_count in 1..=30:
+//   recv_task가 반환한 count를 recv_counter에 fetch_add하면
+//   recv_counter의 값이 정확히 count만큼 증가해야 한다
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(20))]
     #[test]
