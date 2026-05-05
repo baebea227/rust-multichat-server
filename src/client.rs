@@ -77,7 +77,6 @@ pub async fn handle_client(
                         if raw.len() > MAX_LINE_LEN {
                             continue;
                         }
-                        metrics.record_recv();
 
                         let msg: ClientMsg = match serde_json::from_str(&raw) {
                             Ok(m) => m,
@@ -93,6 +92,7 @@ pub async fn handle_client(
                             continue;
                         }
                         tokens -= 1.0;
+                        metrics.record_recv();
 
                         match msg {
                             ClientMsg::SetNick { name } => {
@@ -128,8 +128,11 @@ pub async fn handle_client(
                             }
                         }
                     }
-                    // 연결 종료
-                    Ok(None) | Err(_) => break,
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!(id, err = %e, "소켓 읽기 오류 — 연결 종료");
+                        break;
+                    }
                 }
             }
             _ = &mut write_task => break,
