@@ -60,10 +60,25 @@ pub async fn run(
     // 동일 옵션 재투표로 net-zero 변화를 주어 fresh VoteSnapshot 브로드캐스트 유도.
     // 봇 수가 많을 때 모두 재투표하면 동시 burst가 broadcast 채널을 lagged 상태로 몰아 일부
     // 봇이 갱신 스냅샷을 놓친다 → leader 한 명만 트리거하고 나머지는 broadcast를 수신만 함.
+    //
+    // 또한 1회 재투표만 하면 settle 직후 늦게 도착한 stragglers 의 vote가 다음 fresh snapshot
+    // 없이 묻혀 actual 합계가 expected보다 작아진다. RE_VOTE_ROUNDS 회 반복하여 매 round 마다
+    // fresh snapshot을 트리거함으로써 늦게 처리된 votes 도 결국 broadcast에 실리게 한다.
+    const RE_VOTE_ROUNDS: usize = 3;
+    const RE_VOTE_INTERVAL_MS: u64 = 300;
     if wait_result.is_leader() {
         if let Some(opt) = last_vote {
-            send_msg(&mut writer, &ClientMsg::Vote { option: opt }).await?;
+            for _ in 0..RE_VOTE_ROUNDS {
+                send_msg(&mut writer, &ClientMsg::Vote { option: opt }).await?;
+                sleep(Duration::from_millis(RE_VOTE_INTERVAL_MS)).await;
+            }
         }
+    } else {
+        // 비-리더는 리더의 re-vote 윈도우와 동일한 시간을 대기해야 한다.
+        // 이 동기화가 없으면 비-리더가 리더의 마지막 재투표 snapshot이 도착하기 전에
+        // recv_task를 abort하여 stale snapshot으로 끝나고 → pick_actual_snapshot의
+        // majority가 stale 분포로 끌려간다.
+        sleep(Duration::from_millis(RE_VOTE_ROUNDS as u64 * RE_VOTE_INTERVAL_MS)).await;
     }
 
     // 정착 후 스냅샷 전파 대기
