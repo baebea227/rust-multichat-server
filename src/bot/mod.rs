@@ -322,20 +322,31 @@ pub async fn connect() -> Result<TcpStream> {
 /// 전체 봇 시나리오 실행기
 ///
 /// `ratio`는 mixed 모드에서만 사용된다. 단일 모드에서는 무시된다.
-pub async fn run_scenario(mode: &str, count: usize, msg_per_bot: usize, ratio: Option<&str>) {
+pub async fn run_scenario(
+    mode: &str,
+    count: usize,
+    msg_per_bot: usize,
+    ratio: Option<&str>,
+) -> anyhow::Result<()> {
     if mode == "mixed" {
-        run_mixed_scenario(count, msg_per_bot, ratio).await;
+        run_mixed_scenario(count, msg_per_bot, ratio).await?;
     } else {
         run_single_scenario(mode, count, msg_per_bot).await;
     }
+    Ok(())
 }
 
 /// mixed 모드: 비율에 따라 여러 봇 타입을 혼합 실행
-async fn run_mixed_scenario(count: usize, msg_per_bot: usize, ratio: Option<&str>) {
+async fn run_mixed_scenario(
+    count: usize,
+    msg_per_bot: usize,
+    ratio: Option<&str>,
+) -> anyhow::Result<()> {
     let start = Instant::now();
 
     let spec = match ratio {
-        Some(r) => RatioSpec::parse(r).expect("유효하지 않은 ratio"),
+        Some(r) => RatioSpec::parse(r)
+            .map_err(|e| anyhow::anyhow!("유효하지 않은 ratio: {e}"))?,
         None => RatioSpec::parse(RatioSpec::DEFAULT).unwrap(),
     };
     let allocation = allocate(count, &spec);
@@ -425,6 +436,7 @@ async fn run_mixed_scenario(count: usize, msg_per_bot: usize, ratio: Option<&str
         vote_integrity,
     };
     info!("\n{report}");
+    Ok(())
 }
 
 /// 기존 단일 모드 시나리오
