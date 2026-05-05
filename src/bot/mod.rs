@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Barrier, Mutex};
 use tracing::info;
 
 use crate::protocol::{ClientMsg, N_OPTIONS};
@@ -362,11 +362,20 @@ async fn run_mixed_scenario(
     let mut handles = Vec::new();
     let mut bot_id: u64 = 0;
 
+    // fickle 봇 정합성 측정용 동기화 barrier
+    let fickle_count: usize = allocation
+        .iter()
+        .filter(|(bt, _)| *bt == BotType::Fickle)
+        .map(|(_, n)| *n)
+        .sum();
+    let fickle_barrier = Arc::new(Barrier::new(fickle_count.max(1)));
+
     for (bt, n) in &allocation {
         for _ in 0..*n {
             let recv_counter = recv_counter.clone();
             let rtt_counter = rtt_counter.clone();
             let fickle_results = fickle_results.clone();
+            let fickle_barrier = fickle_barrier.clone();
             let bt = *bt;
             let id = bot_id;
             bot_id += 1;
@@ -377,7 +386,7 @@ async fn run_mixed_scenario(
                         normal::run(id, msg_per_bot, recv_counter, rtt_counter).await
                     }
                     BotType::Fickle => {
-                        match fickle::run(id, msg_per_bot).await {
+                        match fickle::run(id, msg_per_bot, fickle_barrier).await {
                             Ok(fickle_result) => {
                                 fickle_results.lock().await.push(fickle_result);
                                 Ok(())
@@ -448,10 +457,15 @@ async fn run_single_scenario(mode: &str, count: usize, msg_per_bot: usize) {
     let fickle_results: Arc<Mutex<Vec<FickleResult>>> = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::with_capacity(count);
 
+    // fickle 모드일 때만 barrier 크기를 봇 수로, 그 외에는 1로 설정
+    let barrier_size = if mode == "fickle" { count.max(1) } else { 1 };
+    let fickle_barrier = Arc::new(Barrier::new(barrier_size));
+
     for i in 0..count {
         let recv_counter = recv_counter.clone();
         let rtt_counter = rtt_counter.clone();
         let fickle_results = fickle_results.clone();
+        let fickle_barrier = fickle_barrier.clone();
         let mode = mode.to_string();
 
         let handle = tokio::spawn(async move {
@@ -460,7 +474,7 @@ async fn run_single_scenario(mode: &str, count: usize, msg_per_bot: usize) {
                     normal::run(i as u64, msg_per_bot, recv_counter, rtt_counter).await
                 }
                 "fickle" => {
-                    match fickle::run(i as u64, msg_per_bot).await {
+                    match fickle::run(i as u64, msg_per_bot, fickle_barrier).await {
                         Ok(fickle_result) => {
                             fickle_results.lock().await.push(fickle_result);
                             Ok(())
