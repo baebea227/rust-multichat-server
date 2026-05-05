@@ -10,9 +10,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::protocol::ClientMsg;
+use crate::protocol::{ClientMsg, N_OPTIONS};
 
 pub const SERVER_ADDR: &str = "127.0.0.1:8080";
 pub const BOT_RECV_TIMEOUT_SECS: u64 = 30;
@@ -51,6 +52,63 @@ impl RttCounter {
     }
 }
 
+// ── Vote Integrity: FickleResult 구조체 ─────────────────────────────
+
+/// fickle 봇의 실행 결과
+#[derive(Debug, Clone)]
+pub struct FickleResult {
+    /// 마지막으로 투표한 옵션 (0..N_OPTIONS)
+    pub last_vote: Option<usize>,
+    /// 마지막으로 수신한 VoteSnapshot의 counts
+    pub last_snapshot: Option<[u64; N_OPTIONS]>,
+}
+
+// ── Vote Integrity: VoteIntegrityResult 구조체 ──────────────────────
+
+/// 투표 정합성 검증 결과
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoteIntegrityResult {
+    /// 정합성 통과 여부
+    pub passed: bool,
+    /// 봇 측 기대 투표 배열
+    pub expected: [u64; N_OPTIONS],
+    /// 서버 측 VoteSnapshot counts 배열
+    pub actual: [u64; N_OPTIONS],
+    /// 검증에 참여한 fickle 봇 수
+    pub fickle_count: usize,
+}
+
+// ── Vote Integrity: 집계 순수 함수 ──────────────────────────────────
+
+/// 마지막 투표 옵션 목록을 옵션별 카운트 배열로 집계
+pub fn tally_votes(last_votes: &[Option<usize>]) -> [u64; N_OPTIONS] {
+    let mut counts = [0u64; N_OPTIONS];
+    for vote in last_votes {
+        if let Some(opt) = vote {
+            if *opt < N_OPTIONS {
+                counts[*opt] += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// 봇 측 기대 배열과 서버 측 실제 배열을 비교하여 정합성 결과 생성
+pub fn check_vote_integrity(
+    expected: [u64; N_OPTIONS],
+    actual: [u64; N_OPTIONS],
+    fickle_count: usize,
+) -> VoteIntegrityResult {
+    let expected_sum: u64 = expected.iter().sum();
+    let actual_sum: u64 = actual.iter().sum();
+    VoteIntegrityResult {
+        passed: expected_sum == actual_sum,
+        expected,
+        actual,
+        fickle_count,
+    }
+}
+
 // ── Scenario Report: ScenarioReport 구조체 ──────────────────────────
 
 /// 시나리오 실행 결과 요약 리포트
@@ -62,12 +120,24 @@ pub struct ScenarioReport {
     pub failure_count: usize,
     pub elapsed_secs: f64,
     pub avg_rtt_ms: Option<u64>,
+    /// 투표 정합성 검증 결과 (fickle 봇이 있는 경우에만 Some)
+    pub vote_integrity: Option<VoteIntegrityResult>,
 }
 
 impl fmt::Display for ScenarioReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let rtt_str = match self.avg_rtt_ms {
             Some(ms) => format!("{ms}ms"),
+            None => "N/A".to_string(),
+        };
+        let vote_integrity_str = match &self.vote_integrity {
+            Some(vi) => {
+                let status = if vi.passed { "PASS" } else { "FAIL" };
+                format!(
+                    "{} (expected={:?}, actual={:?}, fickle_bots={})",
+                    status, vi.expected, vi.actual, vi.fickle_count
+                )
+            }
             None => "N/A".to_string(),
         };
         write!(
@@ -78,9 +148,10 @@ impl fmt::Display for ScenarioReport {
              success: {}\n\
              failure: {}\n\
              elapsed: {:.2}s\n\
-             avg_rtt: {}",
+             avg_rtt: {}\n\
+             vote_integrity: {}",
             self.mode, self.total_bots, self.success_count,
-            self.failure_count, self.elapsed_secs, rtt_str
+            self.failure_count, self.elapsed_secs, rtt_str, vote_integrity_str
         )
     }
 }
@@ -276,6 +347,7 @@ async fn run_mixed_scenario(count: usize, msg_per_bot: usize, ratio: Option<&str
 
     let recv_counter = Arc::new(AtomicU64::new(0));
     let rtt_counter = RttCounter::new();
+    let fickle_results: Arc<Mutex<Vec<FickleResult>>> = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::new();
     let mut bot_id: u64 = 0;
 
@@ -283,6 +355,7 @@ async fn run_mixed_scenario(count: usize, msg_per_bot: usize, ratio: Option<&str
         for _ in 0..*n {
             let recv_counter = recv_counter.clone();
             let rtt_counter = rtt_counter.clone();
+            let fickle_results = fickle_results.clone();
             let bt = *bt;
             let id = bot_id;
             bot_id += 1;
@@ -292,7 +365,15 @@ async fn run_mixed_scenario(count: usize, msg_per_bot: usize, ratio: Option<&str
                     BotType::Normal => {
                         normal::run(id, msg_per_bot, recv_counter, rtt_counter).await
                     }
-                    BotType::Fickle => fickle::run(id, msg_per_bot).await,
+                    BotType::Fickle => {
+                        match fickle::run(id, msg_per_bot).await {
+                            Ok(fickle_result) => {
+                                fickle_results.lock().await.push(fickle_result);
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
                     BotType::Spammer => {
                         spammer::run(id, msg_per_bot, recv_counter, rtt_counter).await
                     }
@@ -318,6 +399,21 @@ async fn run_mixed_scenario(count: usize, msg_per_bot: usize, ratio: Option<&str
         }
     }
 
+    // 투표 정합성 검증
+    let fickle_results = fickle_results.lock().await;
+    let vote_integrity = if fickle_results.is_empty() {
+        None
+    } else {
+        let last_votes: Vec<Option<usize>> = fickle_results.iter().map(|r| r.last_vote).collect();
+        let expected = tally_votes(&last_votes);
+        let actual = fickle_results
+            .iter()
+            .rev()
+            .find_map(|r| r.last_snapshot)
+            .unwrap_or([0; N_OPTIONS]);
+        Some(check_vote_integrity(expected, actual, fickle_results.len()))
+    };
+
     let elapsed = start.elapsed().as_secs_f64();
     let report = ScenarioReport {
         mode: "mixed".to_string(),
@@ -326,6 +422,7 @@ async fn run_mixed_scenario(count: usize, msg_per_bot: usize, ratio: Option<&str
         failure_count,
         elapsed_secs: elapsed,
         avg_rtt_ms: rtt_counter.average(),
+        vote_integrity,
     };
     info!("\n{report}");
 }
@@ -336,11 +433,13 @@ async fn run_single_scenario(mode: &str, count: usize, msg_per_bot: usize) {
 
     let recv_counter = Arc::new(AtomicU64::new(0));
     let rtt_counter = RttCounter::new();
+    let fickle_results: Arc<Mutex<Vec<FickleResult>>> = Arc::new(Mutex::new(Vec::new()));
     let mut handles = Vec::with_capacity(count);
 
     for i in 0..count {
         let recv_counter = recv_counter.clone();
         let rtt_counter = rtt_counter.clone();
+        let fickle_results = fickle_results.clone();
         let mode = mode.to_string();
 
         let handle = tokio::spawn(async move {
@@ -348,7 +447,15 @@ async fn run_single_scenario(mode: &str, count: usize, msg_per_bot: usize) {
                 "normal" => {
                     normal::run(i as u64, msg_per_bot, recv_counter, rtt_counter).await
                 }
-                "fickle" => fickle::run(i as u64, msg_per_bot).await,
+                "fickle" => {
+                    match fickle::run(i as u64, msg_per_bot).await {
+                        Ok(fickle_result) => {
+                            fickle_results.lock().await.push(fickle_result);
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
                 "spammer" => {
                     spammer::run(i as u64, msg_per_bot, recv_counter, rtt_counter).await
                 }
@@ -389,6 +496,21 @@ async fn run_single_scenario(mode: &str, count: usize, msg_per_bot: usize) {
         info!("누락 없음 확인");
     }
 
+    // 투표 정합성 검증 (fickle 모드에서만)
+    let fickle_results = fickle_results.lock().await;
+    let vote_integrity = if mode == "fickle" && !fickle_results.is_empty() {
+        let last_votes: Vec<Option<usize>> = fickle_results.iter().map(|r| r.last_vote).collect();
+        let expected = tally_votes(&last_votes);
+        let actual = fickle_results
+            .iter()
+            .rev()
+            .find_map(|r| r.last_snapshot)
+            .unwrap_or([0; N_OPTIONS]);
+        Some(check_vote_integrity(expected, actual, fickle_results.len()))
+    } else {
+        None
+    };
+
     let elapsed = start.elapsed().as_secs_f64();
     let report = ScenarioReport {
         mode: mode.to_string(),
@@ -397,6 +519,7 @@ async fn run_single_scenario(mode: &str, count: usize, msg_per_bot: usize) {
         failure_count,
         elapsed_secs: elapsed,
         avg_rtt_ms: rtt_counter.average(),
+        vote_integrity,
     };
     info!("\n{report}");
 }
@@ -713,6 +836,7 @@ mod tests {
             failure_count: 5,
             elapsed_secs: 12.345,
             avg_rtt_ms: Some(42),
+            vote_integrity: None,
         };
         let output = format!("{report}");
 
@@ -735,6 +859,7 @@ mod tests {
             failure_count: 0,
             elapsed_secs: 1.0,
             avg_rtt_ms: None,
+            vote_integrity: None,
         };
         let output = format!("{report}");
 
@@ -799,6 +924,7 @@ mod tests {
                     failure_count,
                     elapsed_secs,
                     avg_rtt_ms,
+                    vote_integrity: None,
                 }
             })
     }
@@ -913,11 +1039,294 @@ mod tests {
         ) {
             let output = format!("{report}");
 
-            let required_keys = ["mode:", "total_bots:", "success:", "failure:", "elapsed:", "avg_rtt:"];
+            let required_keys = ["mode:", "total_bots:", "success:", "failure:", "elapsed:", "avg_rtt:", "vote_integrity:"];
             for key in &required_keys {
                 prop_assert!(output.contains(key),
                     "Display 출력에 '{}' 키가 누락됨. 출력:\n{}", key, output);
             }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Task 5: 투표 정합성 단위 테스트
+    // ══════════════════════════════════════════════════════════════════
+
+    // ── 5.1 tally_votes() 기본 동작 테스트 ──────────────────────────
+
+    #[test]
+    fn tally_votes_basic() {
+        // 4명이 각각 옵션 0, 1, 2, 3에 투표
+        let votes = vec![Some(0), Some(1), Some(2), Some(3)];
+        let result = tally_votes(&votes);
+        assert_eq!(result, [1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn tally_votes_multiple_same_option() {
+        // 여러 명이 같은 옵션에 투표
+        let votes = vec![Some(0), Some(0), Some(1), Some(2), Some(2), Some(2)];
+        let result = tally_votes(&votes);
+        assert_eq!(result, [2, 1, 3, 0]);
+    }
+
+    // ── 5.2 tally_votes() 빈 입력 테스트 ───────────────────────────
+
+    #[test]
+    fn tally_votes_empty_input() {
+        let votes: Vec<Option<usize>> = vec![];
+        let result = tally_votes(&votes);
+        assert_eq!(result, [0, 0, 0, 0]);
+    }
+
+    // ── 5.3 tally_votes() None 및 범위 초과 입력 테스트 ─────────────
+
+    #[test]
+    fn tally_votes_none_excluded() {
+        let votes = vec![Some(0), None, Some(1), None];
+        let result = tally_votes(&votes);
+        assert_eq!(result, [1, 1, 0, 0]);
+    }
+
+    #[test]
+    fn tally_votes_out_of_range_excluded() {
+        // N_OPTIONS == 4이므로 4 이상은 제외
+        let votes = vec![Some(0), Some(4), Some(100), Some(3)];
+        let result = tally_votes(&votes);
+        assert_eq!(result, [1, 0, 0, 1]);
+    }
+
+    #[test]
+    fn tally_votes_all_none() {
+        let votes = vec![None, None, None];
+        let result = tally_votes(&votes);
+        assert_eq!(result, [0, 0, 0, 0]);
+    }
+
+    // ── 5.4 check_vote_integrity() PASS 케이스 테스트 ───────────────
+
+    #[test]
+    fn check_vote_integrity_pass() {
+        let expected = [3, 2, 1, 4]; // 총합 10
+        let actual = [2, 3, 1, 4];   // 총합 10
+        let result = check_vote_integrity(expected, actual, 10);
+        assert!(result.passed);
+        assert_eq!(result.expected, expected);
+        assert_eq!(result.actual, actual);
+        assert_eq!(result.fickle_count, 10);
+    }
+
+    // ── 5.5 check_vote_integrity() FAIL 케이스 테스트 ───────────────
+
+    #[test]
+    fn check_vote_integrity_fail() {
+        let expected = [3, 2, 1, 4]; // 총합 10
+        let actual = [2, 2, 1, 4];   // 총합 9
+        let result = check_vote_integrity(expected, actual, 10);
+        assert!(!result.passed);
+        assert_eq!(result.expected, expected);
+        assert_eq!(result.actual, actual);
+        assert_eq!(result.fickle_count, 10);
+    }
+
+    // ── 5.6 ScenarioReport Display에 vote_integrity PASS/FAIL/N/A 출력 테스트 ─
+
+    #[test]
+    fn scenario_report_display_vote_integrity_pass() {
+        let report = ScenarioReport {
+            mode: "fickle".to_string(),
+            total_bots: 10,
+            success_count: 10,
+            failure_count: 0,
+            elapsed_secs: 1.0,
+            avg_rtt_ms: None,
+            vote_integrity: Some(VoteIntegrityResult {
+                passed: true,
+                expected: [3, 2, 3, 2],
+                actual: [3, 2, 3, 2],
+                fickle_count: 10,
+            }),
+        };
+        let output = format!("{report}");
+        assert!(output.contains("vote_integrity: PASS"));
+    }
+
+    #[test]
+    fn scenario_report_display_vote_integrity_fail() {
+        let report = ScenarioReport {
+            mode: "fickle".to_string(),
+            total_bots: 10,
+            success_count: 10,
+            failure_count: 0,
+            elapsed_secs: 1.0,
+            avg_rtt_ms: None,
+            vote_integrity: Some(VoteIntegrityResult {
+                passed: false,
+                expected: [3, 2, 3, 2],
+                actual: [2, 2, 3, 2],
+                fickle_count: 10,
+            }),
+        };
+        let output = format!("{report}");
+        assert!(output.contains("vote_integrity: FAIL"));
+    }
+
+    #[test]
+    fn scenario_report_display_vote_integrity_na() {
+        let report = ScenarioReport {
+            mode: "normal".to_string(),
+            total_bots: 10,
+            success_count: 10,
+            failure_count: 0,
+            elapsed_secs: 1.0,
+            avg_rtt_ms: None,
+            vote_integrity: None,
+        };
+        let output = format!("{report}");
+        assert!(output.contains("vote_integrity: N/A"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Task 6: 투표 정합성 속성 기반 테스트 (Property-Based Tests)
+    // ══════════════════════════════════════════════════════════════════
+
+    /// 유효한 Option<usize> 투표 목록을 생성하는 전략
+    /// Some(0..N_OPTIONS), Some(범위 초과), None을 혼합
+    fn arb_vote_list() -> impl Strategy<Value = Vec<Option<usize>>> {
+        prop::collection::vec(
+            prop_oneof![
+                // 유효한 투표 (0..N_OPTIONS)
+                (0..N_OPTIONS).prop_map(Some),
+                // 범위 초과 투표
+                (N_OPTIONS..N_OPTIONS + 100).prop_map(Some),
+                // None (투표 없음)
+                Just(None),
+            ],
+            0..200,
+        )
+    }
+
+    // ── 6.1 Property 1: 투표 집계 합계 불변량 ───────────────────────
+    // **Validates: Requirements 2.2**
+    proptest! {
+        #[test]
+        fn prop_tally_votes_sum_invariant(votes in arb_vote_list()) {
+            let result = tally_votes(&votes);
+            let result_sum: u64 = result.iter().sum();
+
+            // 유효 투표 수: Some(v)이고 v < N_OPTIONS인 항목의 수
+            let valid_count = votes.iter()
+                .filter(|v| matches!(v, Some(opt) if *opt < N_OPTIONS))
+                .count() as u64;
+
+            prop_assert_eq!(result_sum, valid_count,
+                "tally_votes 결과 총합({})이 유효 투표 수({})와 불일치. votes={:?}",
+                result_sum, valid_count, votes);
+        }
+    }
+
+    // ── 6.2 Property 2: 정합성 판정 일관성 ──────────────────────────
+    // **Validates: Requirements 4.1, 4.2, 4.3**
+    proptest! {
+        #[test]
+        fn prop_check_vote_integrity_consistency(
+            expected in prop::array::uniform4(0u64..1000),
+            actual in prop::array::uniform4(0u64..1000),
+            fickle_count in 1usize..100
+        ) {
+            let result = check_vote_integrity(expected, actual, fickle_count);
+
+            let expected_sum: u64 = expected.iter().sum();
+            let actual_sum: u64 = actual.iter().sum();
+            let should_pass = expected_sum == actual_sum;
+
+            prop_assert_eq!(result.passed, should_pass,
+                "passed({})가 총합 비교({} == {})와 불일치. expected={:?}, actual={:?}",
+                result.passed, expected_sum, actual_sum, expected, actual);
+        }
+    }
+
+    // ── 6.3 Property 3: Display 라운드트립 (vote_integrity 상태) ────
+    // **Validates: Requirements 5.4**
+    proptest! {
+        #[test]
+        fn prop_vote_integrity_display_roundtrip(
+            passed in proptest::bool::ANY,
+            expected in prop::array::uniform4(0u64..100),
+            actual in prop::array::uniform4(0u64..100),
+            fickle_count in 1usize..50
+        ) {
+            // vote_integrity가 Some인 경우
+            let report = ScenarioReport {
+                mode: "fickle".to_string(),
+                total_bots: 10,
+                success_count: 10,
+                failure_count: 0,
+                elapsed_secs: 1.0,
+                avg_rtt_ms: None,
+                vote_integrity: Some(VoteIntegrityResult {
+                    passed,
+                    expected,
+                    actual,
+                    fickle_count,
+                }),
+            };
+            let output = format!("{report}");
+
+            // vote_integrity 라인에서 상태 복원
+            let vi_line = output.lines()
+                .find(|l| l.starts_with("vote_integrity:"))
+                .expect("vote_integrity 라인 없음");
+
+            if passed {
+                prop_assert!(vi_line.contains("PASS"),
+                    "passed=true인데 PASS가 없음: {}", vi_line);
+                prop_assert!(!vi_line.contains("FAIL"),
+                    "passed=true인데 FAIL이 있음: {}", vi_line);
+            } else {
+                prop_assert!(vi_line.contains("FAIL"),
+                    "passed=false인데 FAIL이 없음: {}", vi_line);
+            }
+        }
+
+        #[test]
+        fn prop_vote_integrity_na_display_roundtrip(
+            mode in prop_oneof![
+                Just("normal".to_string()),
+                Just("ghost".to_string()),
+                Just("quitter".to_string()),
+            ]
+        ) {
+            // vote_integrity가 None인 경우
+            let report = ScenarioReport {
+                mode,
+                total_bots: 10,
+                success_count: 10,
+                failure_count: 0,
+                elapsed_secs: 1.0,
+                avg_rtt_ms: None,
+                vote_integrity: None,
+            };
+            let output = format!("{report}");
+
+            let vi_line = output.lines()
+                .find(|l| l.starts_with("vote_integrity:"))
+                .expect("vote_integrity 라인 없음");
+
+            prop_assert!(vi_line.contains("N/A"),
+                "vote_integrity=None인데 N/A가 없음: {}", vi_line);
+        }
+    }
+
+    // ── 6.4 Property 4: tally_votes 멱등성 ──────────────────────────
+    // **Validates: Requirements 2.2**
+    proptest! {
+        #[test]
+        fn prop_tally_votes_idempotent(votes in arb_vote_list()) {
+            let result1 = tally_votes(&votes);
+            let result2 = tally_votes(&votes);
+            prop_assert_eq!(result1, result2,
+                "동일 입력에 대해 tally_votes 결과가 다름: {:?} vs {:?}",
+                result1, result2);
         }
     }
 }
