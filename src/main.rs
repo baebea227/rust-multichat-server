@@ -53,8 +53,9 @@ async fn main() -> anyhow::Result<()> {
             let room = room::Room::new();
             let vote = vote::VoteBoard::new();
             let metrics = metrics::Metrics::new();
-            metrics::start_reporter(metrics.clone(), Duration::from_secs(5));
+            let _reporter_shutdown = metrics::start_reporter(metrics.clone(), Duration::from_secs(5));
             server::run(&addr, room, vote, metrics).await?;
+            // _reporter_shutdown이 여기서 drop되어 리포터 태스크 종료
         }
         Command::Client { addr } => {
             tui::run(&addr).await?;
