@@ -96,6 +96,30 @@ pub fn tally_votes(last_votes: &[Option<usize>]) -> [u64; N_OPTIONS] {
     counts
 }
 
+/// fickle 봇들의 last_snapshot 중 "권위 있는" 스냅샷 1개를 선택.
+///
+/// broadcast 채널이 잠깐 lagged 상태였던 봇은 stale 스냅샷(또는 None)을 보유한다 —
+/// 단순히 마지막 봇의 스냅샷을 채택하면 그 봇이 lagged 였을 때 정합성 검증이 거짓 FAIL을 낸다.
+/// 다수의 봇이 동일하게 본 스냅샷이 서버의 진짜 최종 상태이므로, 최빈값(majority)을 채택한다.
+/// 동률 시 sum이 더 큰(=더 최근) 쪽을 우선한다.
+pub fn pick_actual_snapshot(results: &[FickleResult]) -> [u64; N_OPTIONS] {
+    use std::collections::HashMap;
+    let mut tally: HashMap<[u64; N_OPTIONS], usize> = HashMap::new();
+    for r in results {
+        if let Some(s) = r.last_snapshot {
+            *tally.entry(s).or_insert(0) += 1;
+        }
+    }
+    tally
+        .into_iter()
+        .max_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then_with(|| a.0.iter().sum::<u64>().cmp(&b.0.iter().sum::<u64>()))
+        })
+        .map(|(snap, _)| snap)
+        .unwrap_or([0; N_OPTIONS])
+}
+
 /// 봇 측 기대 배열과 서버 측 실제 배열을 비교하여 정합성 결과 생성
 pub fn check_vote_integrity(
     expected: [u64; N_OPTIONS],
@@ -461,11 +485,7 @@ async fn run_mixed_scenario(
     } else {
         let last_votes: Vec<Option<usize>> = fickle_results.iter().map(|r| r.last_vote).collect();
         let expected = tally_votes(&last_votes);
-        let actual = fickle_results
-            .iter()
-            .rev()
-            .find_map(|r| r.last_snapshot)
-            .unwrap_or([0; N_OPTIONS]);
+        let actual = pick_actual_snapshot(&fickle_results);
         Some(check_vote_integrity(expected, actual, fickle_results.len()))
     };
 
@@ -562,11 +582,7 @@ async fn run_single_scenario(mode: &str, count: usize, msg_per_bot: usize) {
     let vote_integrity = if mode == "fickle" && !fickle_results.is_empty() {
         let last_votes: Vec<Option<usize>> = fickle_results.iter().map(|r| r.last_vote).collect();
         let expected = tally_votes(&last_votes);
-        let actual = fickle_results
-            .iter()
-            .rev()
-            .find_map(|r| r.last_snapshot)
-            .unwrap_or([0; N_OPTIONS]);
+        let actual = pick_actual_snapshot(&fickle_results);
         Some(check_vote_integrity(expected, actual, fickle_results.len()))
     } else {
         None

@@ -3,7 +3,7 @@ use tokio::sync::{broadcast, RwLock};
 
 use crate::protocol::{BroadcastEvent, ServerMsg};
 
-pub const BROADCAST_CAP: usize = 2048;
+pub const BROADCAST_CAP: usize = 32768;
 
 #[derive(Debug, Clone)]
 pub struct ClientMeta {

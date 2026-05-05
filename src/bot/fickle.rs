@@ -11,8 +11,8 @@ use crate::protocol::{ClientMsg, ServerMsg, N_OPTIONS};
 use super::{connect, send_msg, FickleResult};
 
 /// fickle 봇 정합성 측정 단계 동기화 시간
-const SETTLE_AFTER_BARRIER_MS: u64 = 500;
-const SNAPSHOT_PROPAGATION_MS: u64 = 200;
+const SETTLE_AFTER_BARRIER_MS: u64 = 1500;
+const SNAPSHOT_PROPAGATION_MS: u64 = 1000;
 
 pub async fn run(
     id: u64,
@@ -39,23 +39,31 @@ pub async fn run(
         }
     });
 
+    // 서버의 토큰 버킷(10 token/s, burst 10) 한도에 맞춰 간격을 두지 않으면
+    // 봇이 보낸 투표가 서버에서 드롭되어 expected/actual 분포가 어긋난다.
+    // 110ms 간격은 정상상태 refill 주기(100ms)보다 약간 여유를 둔 값.
+    const VOTE_INTERVAL_MS: u64 = 110;
     let mut last_vote: Option<usize> = None;
     for _ in 0..vote_count {
         let option = rng.gen_range(0..N_OPTIONS);
         send_msg(&mut writer, &ClientMsg::Vote { option }).await?;
         last_vote = Some(option);
-        sleep(Duration::from_millis(10)).await;
+        sleep(Duration::from_millis(VOTE_INTERVAL_MS)).await;
     }
 
     // 모든 fickle 봇이 마지막 투표를 마칠 때까지 동기화
-    barrier.wait().await;
+    let wait_result = barrier.wait().await;
 
     // quitter 등의 disconnect→unvote 전파를 위한 정착 대기
     sleep(Duration::from_millis(SETTLE_AFTER_BARRIER_MS)).await;
 
-    // 동일 옵션 재투표로 net-zero 변화를 주어 fresh VoteSnapshot 브로드캐스트 유도
-    if let Some(opt) = last_vote {
-        send_msg(&mut writer, &ClientMsg::Vote { option: opt }).await?;
+    // 동일 옵션 재투표로 net-zero 변화를 주어 fresh VoteSnapshot 브로드캐스트 유도.
+    // 봇 수가 많을 때 모두 재투표하면 동시 burst가 broadcast 채널을 lagged 상태로 몰아 일부
+    // 봇이 갱신 스냅샷을 놓친다 → leader 한 명만 트리거하고 나머지는 broadcast를 수신만 함.
+    if wait_result.is_leader() {
+        if let Some(opt) = last_vote {
+            send_msg(&mut writer, &ClientMsg::Vote { option: opt }).await?;
+        }
     }
 
     // 정착 후 스냅샷 전파 대기
