@@ -17,6 +17,9 @@ use crate::protocol::{ClientMsg, N_OPTIONS};
 
 pub const SERVER_ADDR: &str = "127.0.0.1:8080";
 pub const BOT_RECV_TIMEOUT_SECS: u64 = 30;
+/// ghost 봇이 lagged-receiver 정리 검증을 위해 연결을 유지하는 시간(초)
+/// — msg_per_bot에 영향받지 않도록 고정 상수로 분리
+pub const GHOST_HOLD_SECS: u64 = 5;
 
 // ── Scenario Report: RttCounter ─────────────────────────────────────
 
@@ -397,7 +400,7 @@ async fn run_mixed_scenario(
                     BotType::Spammer => {
                         spammer::run(id, msg_per_bot, recv_counter, rtt_counter).await
                     }
-                    BotType::Ghost => ghost::run(id, msg_per_bot).await,
+                    BotType::Ghost => ghost::run(id).await,
                     BotType::Quitter => quitter::run(id).await,
                 };
                 if let Err(ref e) = result {
@@ -485,7 +488,7 @@ async fn run_single_scenario(mode: &str, count: usize, msg_per_bot: usize) {
                 "spammer" => {
                     spammer::run(i as u64, msg_per_bot, recv_counter, rtt_counter).await
                 }
-                "ghost" => ghost::run(i as u64, msg_per_bot).await,
+                "ghost" => ghost::run(i as u64).await,
                 "quitter" => quitter::run(i as u64).await,
                 other => {
                     tracing::warn!("알 수 없는 봇 모드: {other}");
