@@ -303,6 +303,40 @@ pub fn allocate(total: usize, spec: &RatioSpec) -> Vec<(BotType, usize)> {
 
 // ── 기존 헬퍼 함수 ─────────────────────────────────────────────────
 
+/// 자기 자신의 메시지를 `msg_count`개 수신할 때까지 카운트하는 공용 recv 루프.
+///
+/// - `line.contains(target)`을 만족하는 라인이 들어올 때마다 `on_match` 콜백을 호출하고 카운트 증가
+/// - `msg_count` 도달 시 즉시 종료
+/// - 입력이 끊기거나(EOF) `timeout_dur` 경과 시에도 종료, 현재까지 수신한 카운트를 반환
+///
+/// normal/spammer 봇과 통합 테스트가 동일한 구현을 공유하기 위해 lib에 노출.
+pub async fn recv_until_count_with_timeout<R, F>(
+    lines: &mut tokio::io::Lines<tokio::io::BufReader<R>>,
+    target: &str,
+    msg_count: u64,
+    timeout_dur: std::time::Duration,
+    mut on_match: F,
+) -> u64
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: FnMut(&str),
+{
+    let mut count: u64 = 0;
+    let _ = tokio::time::timeout(timeout_dur, async {
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.contains(target) {
+                on_match(&line);
+                count += 1;
+                if count >= msg_count {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    count
+}
+
 /// 봇이 소켓으로 JSON 메시지 한 줄을 전송하는 헬퍼
 pub async fn send_msg(
     stream: &mut tokio::io::BufWriter<tokio::net::tcp::OwnedWriteHalf>,

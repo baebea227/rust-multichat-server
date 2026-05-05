@@ -3,10 +3,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader, BufWriter};
-use tokio::time::timeout;
 use tracing::warn;
 
-use super::{connect, send_msg, RttCounter, BOT_RECV_TIMEOUT_SECS};
+use super::{connect, recv_until_count_with_timeout, send_msg, RttCounter, BOT_RECV_TIMEOUT_SECS};
 use crate::protocol::ClientMsg;
 
 fn now_ms() -> u64 {
@@ -27,10 +26,8 @@ pub async fn run(
     let mut lines = BufReader::new(reader).lines();
     let mut writer = BufWriter::new(writer);
 
-    // 송신 시각을 seq별로 기록
     let mut send_timestamps: Vec<u64> = Vec::with_capacity(msg_count);
 
-    // 송신: 클라이언트 송신 시각 client_ts 포함
     for seq in 0..msg_count {
         let ts = now_ms();
         send_timestamps.push(ts);
@@ -45,50 +42,38 @@ pub async fn run(
         .await?;
     }
 
-    // 수신 task: msg_count개 수신하면 스스로 종료 (타임아웃 적용)
     let target = format!("bot_{id}_msg_");
     let recv_task = tokio::spawn(async move {
-        let count = Arc::new(AtomicU64::new(0));
-        let count_inner = count.clone();
-
-        let result = timeout(Duration::from_secs(BOT_RECV_TIMEOUT_SECS), async move {
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.contains(&target) {
-                    let recv_ts = now_ms();
-                    if let Some(seq) = extract_seq(&line, &target) {
-                        if let Some(&send_ts) = send_timestamps.get(seq) {
-                            if recv_ts >= send_ts {
-                                rtt_counter.record(recv_ts - send_ts);
-                            }
-                        }
-                    }
-
-                    let c = count_inner.fetch_add(1, Ordering::Relaxed) + 1;
-                    if c >= msg_count as u64 {
-                        break;
+        let target_owned = target.clone();
+        let on_match = |line: &str| {
+            let recv_ts = now_ms();
+            if let Some(seq) = extract_seq(line, &target_owned) {
+                if let Some(&send_ts) = send_timestamps.get(seq) {
+                    if recv_ts >= send_ts {
+                        rtt_counter.record(recv_ts - send_ts);
                     }
                 }
             }
-            count_inner.load(Ordering::Relaxed)
-        })
+        };
+        let received = recv_until_count_with_timeout(
+            &mut lines,
+            &target,
+            msg_count as u64,
+            Duration::from_secs(BOT_RECV_TIMEOUT_SECS),
+            on_match,
+        )
         .await;
-
-        match result {
-            Ok(c) => c,
-            Err(_) => {
-                let received = count.load(Ordering::Relaxed);
-                warn!(
-                    bot_id = id,
-                    expected = msg_count,
-                    received = received,
-                    "recv_task 타임아웃: {received}/{msg_count} 수신"
-                );
-                received
-            }
+        if received < msg_count as u64 {
+            warn!(
+                bot_id = id,
+                expected = msg_count,
+                received,
+                "recv 루프 조기 종료(타임아웃 또는 EOF)"
+            );
         }
+        received
     });
 
-    // recv 완료 대기 후 writer 종료
     let received = recv_task.await.unwrap_or(0);
     drop(writer);
     recv_counter.fetch_add(received, Ordering::Relaxed);
@@ -96,7 +81,6 @@ pub async fn run(
     Ok(())
 }
 
-/// 수신된 라인에서 target 접두사 이후의 seq 번호를 추출
 fn extract_seq(line: &str, target: &str) -> Option<usize> {
     let idx = line.find(target)?;
     let after = &line[idx + target.len()..];

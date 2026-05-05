@@ -13,47 +13,27 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 
-/// recv_task의 핵심 로직을 재현하는 헬퍼.
-/// 바이너리 크레이트이므로 내부 모듈에 직접 접근할 수 없어
-/// src/bot/normal.rs의 recv_task 로직을 동일하게 구현한다.
+/// 실제 프로덕션 코드(src/bot/mod.rs::recv_until_count_with_timeout)를
+/// lib 경계로 노출한 함수를 직접 호출하는 어댑터.
 ///
-/// 이 함수는 수정된 코드의 recv_task와 동일한 패턴을 사용한다:
-/// - tokio::time::timeout으로 수신 루프 전체를 감싼다
-/// - `while let Ok(Some(line)) = lines.next_line().await` 루프
-/// - target 문자열 매칭으로 count 증가
-/// - count >= msg_count 시 break
-/// - 타임아웃(3초, 테스트용) 발생 시 현재까지 수신된 count를 반환
+/// 이전 구현은 동일 로직을 테스트 파일에 복제하여
+/// 프로덕션 코드 회귀를 잡지 못했다. 이제 본함수를 호출하므로
+/// normal/spammer 봇이 사용하는 동일 함수의 회귀를 검증한다.
 async fn recv_task_current(
     lines: &mut tokio::io::Lines<BufReader<tokio::net::tcp::OwnedReadHalf>>,
     target: &str,
     msg_count: u64,
 ) -> u64 {
-    // 테스트용 타임아웃: 3초 (실제 코드는 BOT_RECV_TIMEOUT_SECS=30초)
+    // 테스트용 타임아웃: 3초 (실제 봇은 BOT_RECV_TIMEOUT_SECS=30초)
     let recv_timeout = Duration::from_secs(3);
-    let count = Arc::new(AtomicU64::new(0));
-    let count_inner = count.clone();
-    let target = target.to_string();
-
-    let result = tokio::time::timeout(recv_timeout, async move {
-        while let Ok(Some(line)) = lines.next_line().await {
-            if line.contains(&target) {
-                let c = count_inner.fetch_add(1, Ordering::Relaxed) + 1;
-                if c >= msg_count {
-                    break;
-                }
-            }
-        }
-        count_inner.load(Ordering::Relaxed)
-    })
-    .await;
-
-    match result {
-        Ok(c) => c,
-        Err(_) => {
-            // 타임아웃 발생: 현재까지 수신된 count를 반환
-            count.load(Ordering::Relaxed)
-        }
-    }
+    rust_projects::bot::recv_until_count_with_timeout(
+        lines,
+        target,
+        msg_count,
+        recv_timeout,
+        |_line| {},
+    )
+    .await
 }
 
 /// Property 1: Bug Condition - recv_task 무한 대기 버그
