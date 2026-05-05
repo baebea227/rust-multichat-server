@@ -165,14 +165,15 @@ pub async fn handle_client(
                                 vote.vote(current_vote, option);
                                 current_vote = Some(option);
                                 // 이슈 6: percentages 함께 전송
+                                // 500봇 × 20표 = 10,000 broadcast burst 방지를 위해 throttle 적용
                                 let (counts, percentages) = vote.snapshot_with_percentages();
-                                room.broadcast(ServerMsg::VoteSnapshot { counts, percentages });
+                                room.broadcast_vote_throttled(ServerMsg::VoteSnapshot { counts, percentages });
                             }
                             ClientMsg::Unvote => {
                                 if let Some(prev) = current_vote.take() {
                                     vote.unvote(prev);
                                     let (counts, percentages) = vote.snapshot_with_percentages();
-                                    room.broadcast(ServerMsg::VoteSnapshot { counts, percentages });
+                                    room.broadcast_vote_throttled(ServerMsg::VoteSnapshot { counts, percentages });
                                 }
                             }
                         }
@@ -192,7 +193,8 @@ pub async fn handle_client(
     if let Some(prev) = current_vote {
         vote.unvote(prev);
         let (counts, percentages) = vote.snapshot_with_percentages();
-        room.broadcast(ServerMsg::VoteSnapshot { counts, percentages });
+        // 500봇 동시 disconnect 시에도 burst 방지
+        room.broadcast_vote_throttled(ServerMsg::VoteSnapshot { counts, percentages });
     }
     room.leave(id).await;
 
