@@ -142,6 +142,8 @@ pub async fn handle_client(
     write_task.abort();
     if let Some(prev) = current_vote {
         vote.unvote(prev);
+        let (counts, percentages) = vote.snapshot_with_percentages();
+        room.broadcast(ServerMsg::VoteSnapshot { counts, percentages });
     }
     room.leave(id).await;
 
