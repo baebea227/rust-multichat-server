@@ -42,9 +42,9 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
-        .init();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let cli = Cli::parse();
 
@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
             tui::run(&addr).await?;
         }
         Command::BotTest { count, mode, msg, ratio } => {
-            bot::run_scenario(&mode, count, msg, ratio.as_deref()).await;
+            bot::run_scenario(&mode, count, msg, ratio.as_deref()).await?;
         }
     }
 
