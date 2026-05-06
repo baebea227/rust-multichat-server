@@ -5,7 +5,7 @@ use tokio::sync::{broadcast, RwLock};
 
 use crate::protocol::{BroadcastEvent, ServerMsg};
 
-pub const BROADCAST_CAP: usize = 131072;
+pub const BROADCAST_CAP: usize = 524288;
 /// VoteSnapshot broadcast 최소 간격 (ms). 매 투표마다 브로드캐스트하면
 /// 500봇 × 20표 = 10,000개 backlog가 쌓여 write_task가 settle 윈도우 안에
 /// 처리하지 못한다 → 50ms 당 최대 1회로 제한 (20Hz, TUI에도 충분)
