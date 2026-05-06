@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
@@ -13,9 +13,6 @@ use crate::{
     room::Room,
     vote::VoteBoard,
 };
-
-const TOKEN_CAPACITY: f64 = 10.0;
-const TOKEN_RATE: f64 = 10.0;
 
 /// '\n'으로 종료된 한 줄을 읽되 max_len 바이트로 상한을 강제한다.
 /// 초과 라인은 다음 '\n'까지 드레인하고 빈 문자열을 반환 — 호출측 JSON 파싱에서 자연스럽게 스킵됨.
@@ -116,8 +113,6 @@ pub async fn handle_client(
     });
 
     let mut current_vote: Option<usize> = None;
-    let mut tokens: f64 = TOKEN_CAPACITY;
-    let mut last_refill = Instant::now();
     let mut nick: Option<String> = None; // 이슈 5: 닉네임
 
     // read task (현재 task): 소켓 수신 → 처리
@@ -131,15 +126,6 @@ pub async fn handle_client(
                             Err(_) => continue,
                         };
 
-                        // 클라이언트별 rate limiting: 토큰 버킷 (10 token/s, burst 10)
-                        let elapsed = last_refill.elapsed().as_secs_f64();
-                        last_refill = Instant::now();
-                        tokens = (tokens + elapsed * TOKEN_RATE).min(TOKEN_CAPACITY);
-                        if tokens < 1.0 {
-                            warn!(id, "rate limit 초과 — 메시지 드롭");
-                            continue;
-                        }
-                        tokens -= 1.0;
                         metrics.record_recv();
 
                         match msg {
