@@ -6,10 +6,12 @@
 ## 1. 프로젝트 개요
 
 ### 1.1. 목표
+
 Rust의 비동기 런타임 `tokio`를 기반으로 **500인 동시접속을 안정적으로 처리하는 멀티채팅 서버**를 구현합니다.
 단순한 메시지 전달을 넘어, **실시간 투표 시스템**을 통해 Write-Heavy 환경에서도 Race Condition 없이 정합성을 보장함을 증명합니다.
 
 ### 1.2. 기술 스택
+
 - **언어**: Rust (edition 2024)
 - **비동기 런타임**: `tokio`
 - **프레이밍**: `tokio-util` LinesCodec (`\n` 단위)
@@ -27,8 +29,7 @@ Rust의 비동기 런타임 `tokio`를 기반으로 **500인 동시접속을 안
 | @zouea4879 | 손승완 | 메트릭 / 프로토콜 | `metrics.rs`, `protocol.rs` |
 | @syeon111 | 박수연 | 방 관리 / 투표 | `room.rs`, `vote.rs`, `README.md` |
 
-
-#### 배상혁 @baebea227 — 서버 / 클라이언트 (Server Core)
+### 배상혁 @baebea227 — 서버 / 클라이언트 (Server Core)
 
 서버 코어의 동시성 모델 설계와 안정화, race condition 추적 / 수정을 전담했습니다.
 
@@ -42,7 +43,7 @@ Rust의 비동기 런타임 `tokio`를 기반으로 **500인 동시접속을 안
 - **Disconnect 경로 보강** — disconnect 시 `VoteSnapshot` 브로드캐스트 누락 수정, `record_recv` 위치 조정 + 소켓 읽기 오류 로깅
 - **봇 정합성 안정화** — fickle leader 재투표 N회 반복 + 비-리더 동기 대기로 straggler vote 누락 완화, Barrier 동기화 + fresh snapshot 트리거 도입
 
-#### 선현승 @Goldbori — 봇 / 통합 테스트 (Adversary & QA)
+### 선현승 @Goldbori — 봇 / 통합 테스트 (Adversary & QA)
 
 서버를 깨뜨리는 봇 시나리오와 통합 테스트 골격을 담당했습니다.
 
@@ -52,7 +53,7 @@ Rust의 비동기 런타임 `tokio`를 기반으로 **500인 동시접속을 안
 - **투표 결과 항목 추가** — 봇 측 검증 로직에 옵션별 카운트 비교 항목 추가
 - **타임아웃 테스트** — `tests/recv_task_timeout_test.rs` 신규로 수신 태스크의 행 방지 보장
 
-#### 손승완 @zouea4879 — 메트릭 / 프로토콜 (Observability & Protocol)
+### 손승완 @zouea4879 — 메트릭 / 프로토콜 (Observability & Protocol)
 
 지연·처리량 측정 인프라와 그에 필요한 프로토콜 확장을 담당했습니다.
 
@@ -61,7 +62,7 @@ Rust의 비동기 런타임 `tokio`를 기반으로 **500인 동시접속을 안
 - **순간 처리량(msg/s) 측정** — 매 tick마다 recv/sent 누적값 delta로 `recv_mps` / `sent_mps` 계산해 리포터에 출력
 - **README 타이틀 정리**
 
-#### 박수연 @syeon111 — 방관리 / 투표 (Room & Vote)
+### 박수연 @syeon111 — 방관리 / 투표 (Room & Vote)
 
 `Room`의 사용자 노출 메시지(Welcome / 닉네임 / VoteSnapshot)와 `protocol-room` PR 라인을 담당했습니다. 영역 경계에서 빠지기 쉬운 사용자 노출 정합성을 채웠습니다.
 
@@ -76,7 +77,7 @@ Rust의 비동기 런타임 `tokio`를 기반으로 **500인 동시접속을 안
 
 ### 3.1. 모듈 구성
 
-```
+```text
 src/
 ├── main.rs        — 진입점, CLI 파싱(clap)
 ├── server.rs      — TcpListener, Semaphore 기반 연결 상한 제어
@@ -94,7 +95,7 @@ src/
 500명에게 메시지를 전달하는 동안 참여자 목록의 Lock을 잡고 있으면 입장/퇴장이 블로킹되어 심각한 병목이 발생합니다. 이를 해결하기 위해 다음과 같이 책임을 분리했습니다.
 
 | 책임 | 자료구조 | Lock 전략 |
-|------|---------|----------|
+| ------ | --------- | ---------- |
 | 메시지 브로드캐스트 | `tokio::sync::broadcast::Sender` | **Lock-Free** — `tx.send()` 1회로 N명에게 전달 |
 | 참여자 목록 관리 | `Arc<RwLock<HashMap<u64, ClientMeta>>>` | 입장/퇴장 시에만 짧게 Write Lock 점유 |
 | 투표 집계 | `[AtomicI64; N_OPTIONS]` | **Lock-Free** — `fetch_add`만 사용 |
@@ -116,6 +117,7 @@ src/
 `vote(prev, next)`는 두 번의 `fetch_add` 호출로 구성됩니다. 두 호출 사이에 `snapshot()`이 끼어들면 일시적으로 카운트가 어긋납니다.
 
 **해결** ([vote.rs:21-30](../src/vote.rs#L21-L30)):
+
 - 순서를 `(next +1, prev -1)`로 두어 옵저버가 보는 일시 상태를 항상 **over-count(과집계)** 로 만든다.
 - `snapshot()`에서 `.max(0)` 클램프와 결합해 음수가 외부로 노출되는 race를 차단.
 - 총합은 잠시 +1이 되었다가 회복되지만, **음수는 절대 보이지 않습니다**.
@@ -125,6 +127,7 @@ src/
 500명이 0.01초 단위로 투표를 바꾸는 환경에서 단순 총합 비교는 의미가 없습니다. 봇이 보낸 마지막 투표 분포와 서버 집계가 **옵션별로 정확히 일치**해야 정합성이 보장됩니다.
 
 **해결**:
+
 - Barrier 동기화 + fresh snapshot 트리거로 측정 시점을 정렬 ([커밋 d54f16e](../#)).
 - 서버 rate-limit에 봇의 투표 간격을 맞춰 straggler 누락을 제거 ([커밋 783b502](../#)).
 - 리더 봇이 N회 재투표를 반복하고 비-리더는 동기 대기 ([커밋 a6357ae](../#)).
@@ -153,7 +156,7 @@ LinesCodec read 단계에서 라인 길이를 강제 제한해 거대한 입력�
 ### 5.1. 봇 5종
 
 | 봇 | 목적 | 검증 항목 |
-|----|------|---------|
+| ---- | ------ | --------- |
 | normal | 일반 채팅 부하 | 누락률 0% |
 | fickle | 변덕쟁이 투표 | 옵션별 정합성 |
 | spammer | 도배 공격 | 서버 크래시 없음 |
@@ -161,15 +164,18 @@ LinesCodec read 단계에서 라인 길이를 강제 제한해 거대한 입력�
 | quitter | 비정상 종료 | 서버 패닉 없음 |
 
 ### 5.2. 통합 테스트
+
 - [tests/stress_test.rs](../tests/stress_test.rs) — 500인 부하
 - [tests/recv_task_timeout_test.rs](../tests/recv_task_timeout_test.rs) — 수신 task 타임아웃
 
 ### 5.3. Property-based Testing
+
 `proptest` 1.x를 dev-dependency로 도입하여, 무작위 입력에 대한 invariant 검증을 가능하게 합니다.
 
 ## 6. 메트릭
 
 [metrics.rs](../src/metrics.rs)에서 다음 지표를 수집합니다.
+
 - **처리량**: 초당 메시지 수 (MPS)
 - **지연 시간**: `client_ts` echo 기반 — 발신자 RTT를 정확히 측정 (이전엔 wall-clock 기반이었으나 시계 차이로 부정확하여 제거됨, [커밋 4fb4c54](../#))
 - **누락률**: 봇 ID + 시퀀스 번호 매칭
