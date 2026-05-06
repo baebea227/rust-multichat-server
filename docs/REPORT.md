@@ -36,7 +36,6 @@ Rust의 비동기 런타임 `tokio`를 기반으로 **500인 동시접속을 안
 - **초기 스캐폴드 작성** — `tokio` 기반 채팅 서버 골격, 모듈 분리(`server`, `client`, `room`, `vote`, `protocol`, `metrics`, `bot`, `tui`)
 - **연결 상한 강제** — `MAX_CONNECTIONS = 500` 초과 접속 거절 → 단순 카운터에서 `Arc<Semaphore>` `try_acquire_owned()` 기반으로 교체해 `load → check → add` race 제거
 - **Graceful Shutdown** — SIGINT 수신 시 `BroadcastEvent::Shutdown` 전파, 클라이언트 task `JoinHandle` 전체 await, 메트릭 리포터 별도 shutdown 신호
-- **Rate Limiter 교체** — fixed window → token bucket으로 보다 매끄러운 burst 처리
 - **투표 가시 race 차단** — `vote()`의 두 `fetch_add` 순서를 `(next +1, prev -1)`로 뒤집고 `snapshot()`에 `.max(0)` 클램프 적용 → 음수 노출 race 제거
 - **종료된 client task reap** — `handles.retain(|h| !h.is_finished())`로 장기 가동 메모리 누수 방지
 - **DoS 내성** — LinesCodec read 단계에서 라인 길이 강제 제한(`MAX_LINE_LEN = 65536`)
@@ -75,6 +74,10 @@ Rust의 비동기 런타임 `tokio`를 기반으로 **500인 동시접속을 안
 
 ## 3. 시스템 아키텍처
 
+![RustChat 핵심 동시성 구조](./diagram.png)
+
+위 다이어그램은 클라이언트별 read/write task 분리, AtomicI64 기반 투표 집계, CAS 기반 VoteSnapshot broadcast throttle이 어떻게 연결되는지 보여 줍니다.
+
 ### 3.1. 모듈 구성
 
 ```text
@@ -90,7 +93,13 @@ src/
 └── bot/           — 5종 봇 (normal, fickle, spammer, ghost, quitter)
 ```
 
-### 3.2. 핵심 설계 원칙: **상태와 전달의 분리**
+### 3.2. 클라이언트 처리 구조 — read/write task 분리
+
+[client.rs](../src/client.rs)에서는 `stream.into_split()`으로 TCP 스트림을 reader와 writer로 분리하고, writer 쪽은 별도 `tokio::spawn` task로 실행합니다. 덕분에 클라이언트의 송신 대기와 수신 처리가 서로를 막지 않으며, broadcast 메시지를 받는 동안에도 입력 처리가 독립적으로 진행됩니다.
+
+이 구조는 500명 동시 접속 상황에서 특정 클라이언트의 느린 write가 read loop 전체를 지연시키는 문제를 줄여 줍니다.
+
+### 3.3. 핵심 설계 원칙: **상태와 전달의 분리**
 
 500명에게 메시지를 전달하는 동안 참여자 목록의 Lock을 잡고 있으면 입장/퇴장이 블로킹되어 심각한 병목이 발생합니다. 이를 해결하기 위해 다음과 같이 책임을 분리했습니다.
 
@@ -102,7 +111,7 @@ src/
 
 [room.rs](../src/room.rs)에서 두 책임이 같은 구조체 `Room`에 묶여 있지만, `tx`는 broadcast 채널이고 `clients`는 RwLock으로 분리되어 서로 간섭하지 않습니다.
 
-### 3.3. 연결 상한 제어 — Semaphore
+### 3.4. 연결 상한 제어 — Semaphore
 
 [server.rs:32-56](../src/server.rs#L32-L56)에서 `Arc<Semaphore>`의 `try_acquire_owned()`로 연결 상한(500)을 원자적으로 강제합니다.
 
@@ -115,6 +124,8 @@ src/
 ### 4.1. 투표 집계의 가시 race — 음수 노출 차단
 
 `vote(prev, next)`는 두 번의 `fetch_add` 호출로 구성됩니다. 두 호출 사이에 `snapshot()`이 끼어들면 일시적으로 카운트가 어긋납니다.
+
+구현은 [vote.rs](../src/vote.rs)의 `counts: [AtomicI64; N_OPTIONS]` 필드를 중심으로 구성했습니다. 각 선택지 카운터를 독립적인 atomic 값으로 두고, 투표 변경 시 `fetch_add(+1)`을 먼저 수행한 뒤 이전 선택지에 `fetch_add(-1)`을 적용합니다.
 
 **해결** ([vote.rs:21-30](../src/vote.rs#L21-L30)):
 
@@ -129,23 +140,28 @@ src/
 **해결**:
 
 - Barrier 동기화 + fresh snapshot 트리거로 측정 시점을 정렬 ([커밋 d54f16e](../#)).
-- 서버 rate-limit에 봇의 투표 간격을 맞춰 straggler 누락을 제거 ([커밋 783b502](../#)).
 - 리더 봇이 N회 재투표를 반복하고 비-리더는 동기 대기 ([커밋 a6357ae](../#)).
 
-### 4.3. 종료된 task 핸들 reap
+### 4.3. VoteSnapshot broadcast throttle
+
+500봇 환경에서는 매 vote마다 `VoteSnapshot`을 broadcast하면 채널에 너무 많은 갱신이 몰려 정합성 측정 자체가 흔들릴 수 있습니다. 이를 막기 위해 [room.rs](../src/room.rs)의 `last_vote_broadcast_ms: AtomicU64`를 기준으로 50ms 단위 broadcast 슬롯을 둡니다.
+
+각 vote 처리 시 현재 시각과 마지막 broadcast 시각을 비교하고, 50ms 이상 지난 경우에만 `compare_exchange`로 슬롯 선점을 시도합니다. CAS에 성공한 task만 snapshot을 전송하고, 나머지는 이미 다른 task가 최신 broadcast를 맡았다고 보고 스킵합니다. 이 방식은 별도 lock 없이 broadcast 빈도를 제한하면서도 최신 상태 전파는 유지합니다.
+
+### 4.4. 종료된 task 핸들 reap
 
 장기 가동 시 `tokio::spawn`으로 만든 핸들이 누적되면 메모리 누수의 원인이 됩니다.
 [server.rs:72](../src/server.rs#L72)에서 매 accept 마다 `handles.retain(|h| !h.is_finished())`로 회수합니다.
 
-### 4.4. DoS 내성 — 라인 길이 제한
+### 4.5. DoS 내성 — 라인 길이 제한
 
 LinesCodec read 단계에서 라인 길이를 강제 제한해 거대한 입력으로 메모리를 고갈시키는 공격을 차단합니다 ([커밋 faabcb1](../#)). `MAX_LINE_LEN = 65536`바이트.
 
-### 4.5. Disconnect 시 VoteSnapshot 누락
+### 4.6. Disconnect 시 VoteSnapshot 누락
 
 기존 코드는 클라이언트 disconnect 시 unvote만 수행하고 스냅샷 브로드캐스트를 하지 않아, 다른 클라이언트는 변경을 인지하지 못했습니다. [커밋 2cca813](../#)에서 disconnect 경로에도 스냅샷 송신을 추가했습니다.
 
-### 4.6. Graceful Shutdown
+### 4.7. Graceful Shutdown
 
 - SIGINT 수신 시 `BroadcastEvent::Shutdown`을 모든 클라이언트에 전파.
 - 서버는 미완료 클라이언트 task의 `JoinHandle`을 모두 await ([커밋 34dfbad](../#)).
@@ -191,7 +207,7 @@ LinesCodec read 단계에서 라인 길이를 강제 제한해 거대한 입력�
 
 Rust의 `tokio` 비동기 런타임을 기반으로 **500인 동시접속 멀티채팅 서버**를 성공적으로 구현했습니다.
 
-핵심 목표였던 **동시성 정합성**은 세 가지 설계로 달성했습니다. 메시지 전달은 `broadcast::Sender`로 Lock 없이 처리하고, 연결 상한은 `Arc<Semaphore>`로 원자적으로 강제하며, 투표 집계는 `[AtomicI64; N_OPTIONS]`와 fetch_add 순서 보장으로 음수 노출 race를 원천 차단했습니다.
+핵심 목표였던 **동시성 정합성**은 read/write task 분리, Lock-Free 상태 관리, atomic 기반 투표 집계를 조합해 달성했습니다. 메시지 전달은 `broadcast::Sender`로 Lock 없이 처리하고, 연결 상한은 `Arc<Semaphore>`로 원자적으로 강제하며, 투표 집계는 `[AtomicI64; N_OPTIONS]`와 fetch_add 순서 보장으로 음수 노출 race를 원천 차단했습니다. 또한 CAS 기반 `VoteSnapshot` broadcast throttle로 고빈도 투표 상황에서도 갱신 폭주를 완화했습니다.
 
 5종 봇(normal / fickle / spammer / ghost / quitter)으로 구성한 통합 테스트에서 **element-wise 투표 정합성 PASS**와 **채팅 누락률 0%** 를 확인했습니다. Rust의 타입 시스템과 소유권 모델이 설계 단계에서 다수의 race condition 가능성을 컴파일 타임에 제거해 주었고, 이는 고부하 환경에서 서버 안정성으로 직결되었습니다.
 
