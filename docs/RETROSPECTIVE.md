@@ -18,24 +18,27 @@ adversarial 봇 5종(normal/fickle/spammer/ghost/quitter)을 일찍 갖춘 덕�
 ### 2.1. 두 fetch_add 사이의 가시 race
 가장 오래 붙잡고 있었던 문제다. `vote(prev, next)`에서 prev를 먼저 빼면 다른 스레드의 snapshot이 음수를 보게 된다. CAS 루프나 Mutex로 가는 길도 있었지만, **순서를 (+1 먼저, -1 나중)으로 뒤집고 `.max(0)` 클램프를 끼우는** 단순한 해법이 가장 깔끔했다. 일시적으로 +1 over-count가 보일 수 있지만, 음수가 노출되지 않는 invariant가 훨씬 가치 있었다.
 
-> **배운 점**: Lock-Free 코드에서는 "정확한 값"이 아니라 "관찰자에게 invariant가 깨지지 않는 값"을 목표로 잡아야 한다.
-
 ### 2.2. fickle 봇의 정합성 측정
-이게 진짜 어려웠다. 봇이 0.01초 단위로 투표를 바꾸는데, 측정 시점에 누가 어떤 옵션에 있는지 어떻게 확정할 것인가? 처음엔 "총합만 맞으면 OK"로 시작했다가, "총합은 맞는데 분포가 drift하는" 케이스를 발견하고 element-wise 비교로 강화했다. 그러자 이번엔 "투표 간격이 서버 rate-limit보다 빨라서 일부가 drop되는" 문제가 드러났고, 봇 간격 조정 → Barrier 동기화 → 리더의 N회 재투표까지 단계적으로 정합성을 확보했다.
+봇이 0.01초 단위로 투표를 바꾸는데, 측정 시점에 누가 어떤 옵션에 있는지 어떻게 확정할 것인가? 처음엔 "총합만 맞으면 OK"로 시작했다가, "총합은 맞는데 분포가 drift하는" 케이스를 발견하고 element-wise 비교로 강화했다. 그러자 이번엔 "투표 간격이 서버 rate-limit보다 빨라서 일부가 drop되는" 문제가 드러났고, 봇 간격 조정 → Barrier 동기화 → 리더의 N회 재투표까지 단계적으로 정합성을 확보했다. 마지막에는 클라이언트별 rate-limit 자체를 제거하는 것이 근본 해결이었다 — 간격을 아무리 조정해도 burst가 허용되지 않으면 zero-drop 검증이 불가능했다.
 
-> **배운 점**: 분산 시스템에서 "정합성이 맞는 것을 증명하는" 측정 자체가 시스템 설계만큼 어렵다.
+### 2.3. VoteSnapshot broadcast 폭주
+throttle을 넣기 전에는 500봇이 매 vote마다 broadcast를 트리거하니 VoteSnapshot이 약 10,000회 쏟아졌다. write_task backlog가 3초짜리 settle 윈도우 안에 소진되지 않아, fickle 봇들이 stale snapshot을 마지막 상태로 캡처하는 버그가 생겼다 — 정합성 테스트가 이유를 알 수 없이 FAIL하는 상황이었다.
 
-### 2.3. 종료 처리(graceful shutdown)
-이게 의외로 까다로웠다. SIGINT에서 단순히 `process::exit()`을 부르면 metrics 리포터가 마지막 누락률을 출력하지 못하고, 클라이언트 task가 중간에 끊겨 봇 검증 결과가 부정확해진다. 결국 다음 순서로 정리됨:
+CAS 기반 50ms throttle로 10,000회를 ~68회로 줄이니 바로 해결됐다. 그런데 throttle만 넣으면 "마지막 vote가 영영 누락"되는 새 문제가 생겼고, pending flush 경로를 별도로 추가해야 했다. 하나를 고치면 다음 문제가 드러나는 레이어드 버그였다.
+
+### 2.4. 종료 처리(graceful shutdown)
+
+SIGINT에서 단순히 `process::exit()`을 부르면 metrics 리포터가 마지막 누락률을 출력하지 못하고, 클라이언트 task가 중간에 끊겨 봇 검증 결과가 부정확해진다. 결국 다음 순서로 정리됨:
 1. broadcast로 `Shutdown` 이벤트 전파
 2. 클라이언트 task `JoinHandle`을 모두 await
 3. 메트릭 리포터에 별도 shutdown 신호 송신
 
 ## 3. 뭘 배웠는가
 
-- **tokio broadcast 채널의 성격**: backpressure(lagged) 시 receiver가 메시지를 잃을 수 있다는 점은 capacity를 32768로 충분히 크게 잡는 것으로 회피했지만, 본질적으로는 producer가 빠르고 consumer가 느릴 때의 정책 결정이 필요하다.
+- **tokio broadcast 채널의 성격**: backpressure(lagged) 시 receiver가 메시지를 잃을 수 있다. "크게 잡으면 되겠지"로 32k에서 시작했지만 부하가 커질수록 부족해져 결국 524k까지 세 번을 올렸다. capacity 조정만으로는 한계가 있고, 근본적으로 producer 빈도를 throttle해야 한다는 걸 직접 겪었다.
 - **Lock-Free의 진짜 비용**: Mutex보다 빠른 게 아니라, "Mutex의 경합 비용이 뼈아플 때만" 빠르다. 이번 프로젝트에서는 투표 카운터 4개에 500명이 동시 접근하는 좁은 핫스팟이 정확히 그 케이스였다.
 - **Property-based testing의 가치**: 손으로 짠 케이스 10개보다 proptest의 임의 입력 1000개가 race를 잘 잡는다.
+- **측정 경로도 설계해야 한다**: 처음에 서버 수신 시점 기준으로 latency를 쟀더니 항상 ~0ms가 나왔다. 클라이언트 송신 시각(`client_ts`)을 broadcast에 echo해서 발신자가 자기 monotonic 시계로 RTT를 계산하도록 바꾸고 나서야 의미 있는 수치가 나왔다. 구현이 맞아도 측정이 틀리면 아무것도 모르는 것과 같다.
 - **Rust의 ownership이 동시성에서 진짜 강력하다**: `Send + Sync` 요구 덕분에, "이 데이터를 task 간에 어떻게 공유하지?"라는 질문이 컴파일 타임에 강제로 답해진다. C++/Go였으면 런타임에서 한참 헤맸을 race가 컴파일 시점에 막혔다.
 
 ## 4. 아쉬운 점
