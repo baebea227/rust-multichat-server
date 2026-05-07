@@ -263,7 +263,7 @@ fn render_chat(f: &mut ratatui::Frame, state: &AppState, area: ratatui::layout::
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Chat  참여자: {} ", state.client_count)),
+            .title(format!(" Chat  참여자: {} ", state.client_count-1)),
     );
     f.render_widget(list, area);
 }

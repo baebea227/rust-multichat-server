@@ -212,7 +212,7 @@ async fn stress_test(bot_count: usize, msg_per_bot: usize) {
          throughput: {throughput:.0} msg/s\n\
          avg_rtt: {}\n\
          p95_rtt: {}\n\
-         p99_rtt: {}",
+         p99_rtt: {}\n",
         format_optional_ms(avg_rtt_ms),
         format_optional_ms(p95_rtt_ms),
         format_optional_ms(p99_rtt_ms),

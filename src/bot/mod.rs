@@ -373,7 +373,25 @@ pub async fn send_msg(
 }
 
 pub async fn connect() -> Result<TcpStream> {
-    Ok(TcpStream::connect(SERVER_ADDR).await?)
+    // 대량 동시 connect 시 서버 listen backlog가 잠깐 가득 차면 Windows는
+    // 즉시 RST(ECONNREFUSED, os error 10061)를 회신한다. 짧은 backoff로 재시도해
+    // 일시적 backlog overflow를 흡수한다.
+    const MAX_ATTEMPTS: usize = 8;
+    const BASE_BACKOFF_MS: u64 = 20;
+    let mut last_err: Option<std::io::Error> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match TcpStream::connect(SERVER_ADDR).await {
+            Ok(s) => return Ok(s),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                last_err = Some(e);
+                let delay = BASE_BACKOFF_MS * (1u64 << attempt.min(5));
+                let jitter = (rand::random::<u64>() % BASE_BACKOFF_MS).max(1);
+                tokio::time::sleep(std::time::Duration::from_millis(delay + jitter)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(last_err.unwrap().into())
 }
 
 // ── Task 3: run_scenario (mixed 분기 추가) ──────────────────────────

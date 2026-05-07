@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
@@ -14,9 +14,15 @@ use crate::{
 };
 
 pub const MAX_CONNECTIONS: usize = 500;
+/// SYN burst(수백 개 봇 동시 connect)에서 backlog overflow → ECONNREFUSED 방지.
+const LISTEN_BACKLOG: u32 = 8192;
 
 pub async fn run(addr: &str, room: Arc<Room>, vote: Arc<VoteBoard>, metrics: Arc<Metrics>) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(addr).await?;
+    let sock_addr: std::net::SocketAddr = addr.parse()?;
+    let socket = if sock_addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
+    socket.set_reuseaddr(true)?;
+    socket.bind(sock_addr)?;
+    let listener = socket.listen(LISTEN_BACKLOG)?;
     run_with_listener(listener, room, vote, metrics).await
 }
 
