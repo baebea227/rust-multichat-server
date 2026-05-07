@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, RwLock};
 
@@ -23,6 +24,8 @@ pub struct Room {
     pub clients: Arc<RwLock<HashMap<u64, ClientMeta>>>,
     /// 마지막 VoteSnapshot broadcast 시각 (Unix ms). throttle 구현용.
     last_vote_broadcast_ms: AtomicU64,
+    pending_vote_broadcast: StdMutex<Option<ServerMsg>>,
+    vote_flush_scheduled: AtomicBool,
 }
 
 impl Room {
@@ -37,6 +40,8 @@ impl Room {
             tx,
             clients: Arc::new(RwLock::new(HashMap::new())),
             last_vote_broadcast_ms: AtomicU64::new(0),
+            pending_vote_broadcast: StdMutex::new(None),
+            vote_flush_scheduled: AtomicBool::new(false),
         })
     }
 
@@ -83,7 +88,7 @@ impl Room {
     /// VoteSnapshot 전용 throttled broadcast.
     /// VOTE_BROADCAST_THROTTLE_MS 간격 안에 이미 broadcast가 나갔으면 스킵.
     /// compare_exchange로 슬롯을 선점한 쪽만 실제 전송하여 burst를 억제.
-    pub fn broadcast_vote_throttled(&self, msg: ServerMsg) {
+    pub fn broadcast_vote_throttled(self: &Arc<Self>, msg: ServerMsg) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -95,7 +100,111 @@ impl Room {
                 .is_ok()
             {
                 let _ = self.tx.send(BroadcastEvent::Server(msg));
+                return;
             }
         }
+
+        if let Ok(mut pending) = self.pending_vote_broadcast.lock() {
+            *pending = Some(msg);
+        }
+        self.schedule_vote_flush();
+    }
+
+    fn schedule_vote_flush(self: &Arc<Self>) {
+        if self.vote_flush_scheduled.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
+        let room = self.clone();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last = self.last_vote_broadcast_ms.load(Ordering::Relaxed);
+        let delay_ms = VOTE_BROADCAST_THROTTLE_MS
+            .saturating_sub(now_ms.saturating_sub(last))
+            .max(1);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            room.flush_pending_vote_snapshot();
+        });
+    }
+
+    fn flush_pending_vote_snapshot(&self) {
+        self.vote_flush_scheduled.store(false, Ordering::Relaxed);
+
+        let pending = self
+            .pending_vote_broadcast
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take());
+
+        if let Some(msg) = pending {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            self.last_vote_broadcast_ms.store(now_ms, Ordering::Relaxed);
+            let _ = self.tx.send(BroadcastEvent::Server(msg));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use crate::protocol::N_OPTIONS;
+
+    use super::*;
+
+    fn vote_snapshot(counts: [u64; N_OPTIONS]) -> ServerMsg {
+        let total: u64 = counts.iter().sum();
+        let percentages = std::array::from_fn(|i| {
+            if total == 0 {
+                0.0
+            } else {
+                counts[i] as f32 / total as f32
+            }
+        });
+        ServerMsg::VoteSnapshot {
+            counts,
+            percentages,
+        }
+    }
+
+    #[tokio::test]
+    async fn throttled_vote_broadcast_flushes_latest_pending_snapshot() {
+        let room = Room::new_with_capacity(16);
+        let mut rx = room.subscribe();
+
+        room.broadcast_vote_throttled(vote_snapshot([1, 0, 0, 0]));
+        let first = tokio::time::timeout(Duration::from_millis(100), rx.recv())
+            .await
+            .expect("first snapshot timed out")
+            .expect("broadcast channel closed");
+
+        assert!(matches!(
+            first,
+            BroadcastEvent::Server(ServerMsg::VoteSnapshot {
+                counts: [1, 0, 0, 0],
+                ..
+            })
+        ));
+
+        room.broadcast_vote_throttled(vote_snapshot([0, 0, 0, 0]));
+        let flushed = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("pending snapshot timed out")
+            .expect("broadcast channel closed");
+
+        assert!(matches!(
+            flushed,
+            BroadcastEvent::Server(ServerMsg::VoteSnapshot {
+                counts: [0, 0, 0, 0],
+                ..
+            })
+        ));
     }
 }
